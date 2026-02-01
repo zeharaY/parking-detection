@@ -1,57 +1,17 @@
 """
 🚗 Parking Spot Detection App
-Deployed on Streamlit Cloud
+Simplified for Streamlit Cloud deployment
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 import plotly.express as px
 import cv2
 import joblib
-import json
-import time
-from datetime import datetime, timedelta
-import requests
-from PIL import Image
-import io
-import base64
-from collections import defaultdict
+from datetime import datetime
 import tempfile
 import os
-import sys
-import types
-
-from sklearn.svm import SVC
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-
-# ============================
-# SIMPLIFIED SVM CLASSIFIER CLASS
-# ============================
-class BackgroundSubtractionSVM:
-    """
-    Simplified SVM classifier for inference only
-    (No imblearn dependency needed)
-    """
-    
-    def __init__(self, use_smote=True):
-        self.use_smote = use_smote
-        self.scaler = StandardScaler()
-        self.svm = None
-    
-    def predict(self, X_features):
-        """Make predictions"""
-        if self.svm is None:
-            raise ValueError("Model not trained yet")
-        return self.svm.predict(X_features)
-    
-    def predict_proba(self, X_features):
-        """Get prediction probabilities"""
-        if self.svm is None:
-            raise ValueError("Model not trained yet")
-        return self.svm.predict_proba(X_features)
 
 # ============================
 # CUSTOM BACKGROUND SUBTRACTOR CLASS
@@ -59,7 +19,6 @@ class BackgroundSubtractionSVM:
 class BackgroundSubtractor:
     """
     Custom background subtraction for parking spot analysis
-    Identical to the one used in training
     """
     def __init__(self, method='mog2', learning_rate=0.001,
                  history=500, varThreshold=16, detectShadows=False, dist2Threshold=400):
@@ -72,7 +31,6 @@ class BackgroundSubtractor:
         self._init_cv2_subtractor()
 
     def _init_cv2_subtractor(self):
-        """Initializes the cv2 background subtractor object"""
         if self.method == 'mog2':
             self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
                 history=self.history, 
@@ -89,18 +47,15 @@ class BackgroundSubtractor:
             raise ValueError("Method must be 'mog2' or 'knn'")
 
     def __getstate__(self):
-        """Prepare for pickling"""
         state = self.__dict__.copy()
         del state['bg_subtractor']
         return state
 
     def __setstate__(self, state):
-        """Restore from pickling"""
         self.__dict__.update(state)
         self._init_cv2_subtractor()
 
     def apply(self, image):
-        """Apply background subtraction to image"""
         fg_mask = self.bg_subtractor.apply(image, learningRate=self.learning_rate)
         
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -111,7 +66,6 @@ class BackgroundSubtractor:
         return foreground, fg_mask
 
     def extract_features(self, image, mask):
-        """Extract features from foreground"""
         features = []
         
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -178,24 +132,21 @@ class ParkingSpotPredictor:
     
     def __init__(self, model_data):
         """Initialize predictor with trained model"""
-        # Directly use the saved model - it should be a trained sklearn model
         self.model = model_data['svm_model']
         self.bg_subtractor = model_data['bg_subtractor']
         self.feature_names = model_data.get('feature_names', [])
         self.model_accuracy = model_data.get('accuracy', 0.0)
         
         self.lighting_profiles = {
-            "daylight": {"threshold": 0.5, "brightness": 0, "contrast": 0},
-            "dusk": {"threshold": 0.45, "brightness": -20, "contrast": 10},
-            "night": {"threshold": 0.4, "brightness": -40, "contrast": 20},
-            "overcast": {"threshold": 0.48, "brightness": -15, "contrast": 15},
-            "bright_sun": {"threshold": 0.52, "brightness": 20, "contrast": -5}
+            "daylight": {"threshold": 0.5},
+            "dusk": {"threshold": 0.45},
+            "night": {"threshold": 0.4},
+            "overcast": {"threshold": 0.48},
+            "bright_sun": {"threshold": 0.52}
         }
         
         self.current_threshold = 0.5
         self.current_lighting_mode = "daylight"
-        
-        st.success(f"✅ Model loaded successfully (Accuracy: {self.model_accuracy:.2%})")
     
     def set_lighting_mode(self, mode):
         """Set lighting mode and adjust threshold"""
@@ -216,21 +167,7 @@ class ParkingSpotPredictor:
         """Preprocess parking spot image"""
         target_size = (64, 64)
         resized = cv2.resize(image, target_size)
-        
-        profile = self.lighting_profiles[self.current_lighting_mode]
-        hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
-        h, s, v = cv2.split(hsv)
-        
-        v = cv2.add(v, profile["brightness"])
-        v = np.clip(v, 0, 255)
-        
-        if profile["contrast"] != 0:
-            alpha = 1 + profile["contrast"] / 100
-            v = cv2.multiply(v, alpha)
-            v = np.clip(v, 0, 255)
-        
-        hsv_adjusted = cv2.merge([h, s, v])
-        return cv2.cvtColor(hsv_adjusted, cv2.COLOR_HSV2BGR)
+        return resized
     
     def extract_features(self, image):
         """Extract features using background subtraction"""
@@ -257,10 +194,11 @@ class ParkingSpotPredictor:
             proba = [1 - prediction, prediction]
             confidence = 0.8
         
-        feature_values = {}
-        if self.feature_names and len(self.feature_names) == len(features):
-            for i, (name, value) in enumerate(zip(self.feature_names, features)):
-                feature_values[name] = float(value)
+        # Convert mask for display
+        if mask.dtype != np.uint8:
+            mask_display = (mask * 255).astype(np.uint8)
+        else:
+            mask_display = mask
         
         return {
             "prediction": "occupied" if prediction == 1 else "available",
@@ -269,9 +207,9 @@ class ParkingSpotPredictor:
             "probability_available": float(proba[0]),
             "threshold_used": float(self.current_threshold),
             "lighting_mode": self.current_lighting_mode,
-            "features": feature_values,
+            "features": dict(zip(self.feature_names, features.tolist())) if self.feature_names else {},
             "processed_image": processed_image,
-            "foreground_mask": mask,
+            "foreground_mask": mask_display,
             "foreground_image": foreground,
             "feature_vector": features.tolist()
         }
@@ -297,10 +235,10 @@ def main():
         font-size: 2.5rem;
         color: #1E3A8A;
         text-align: center;
-        margin-bottom: 2rem;
+        margin-bottom: 1rem;
     }
     .prediction-box {
-        padding: 20px;
+        padding: 15px;
         border-radius: 10px;
         margin: 10px 0;
     }
@@ -316,23 +254,7 @@ def main():
         background-color: #F3F4F6;
         padding: 1rem;
         border-radius: 10px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 50px;
-        white-space: pre-wrap;
-        background-color: #F0F2F6;
-        border-radius: 5px 5px 0px 0px;
-        gap: 1px;
-        padding-top: 10px;
-        padding-bottom: 10px;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #1E3A8A;
-        color: white;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
     </style>
     """, unsafe_allow_html=True)
@@ -346,6 +268,8 @@ def main():
         st.session_state.predictor = None
     if 'model_loaded' not in st.session_state:
         st.session_state.model_loaded = False
+    if 'last_prediction' not in st.session_state:
+        st.session_state.last_prediction = None
     
     # Sidebar
     with st.sidebar:
@@ -368,38 +292,8 @@ def main():
                         tmp.write(uploaded_model.getvalue())
                         tmp_path = tmp.name
                     
-                    # Create dummy imblearn module to avoid import errors
-                    dummy_imblearn = types.ModuleType('imblearn')
-                    dummy_imblearn.over_sampling = types.ModuleType('imblearn.over_sampling')
-                    dummy_imblearn.pipeline = types.ModuleType('imblearn.pipeline')
-                    
-                    # Create dummy classes
-                    class DummySMOTE:
-                        def __init__(self, **kwargs):
-                            pass
-                    
-                    class DummyImbPipeline:
-                        def __init__(self, steps):
-                            self.steps = steps
-                        def fit(self, X, y):
-                            return self
-                    
-                    dummy_imblearn.over_sampling.SMOTE = DummySMOTE
-                    dummy_imblearn.pipeline.Pipeline = DummyImbPipeline
-                    
-                    sys.modules['imblearn'] = dummy_imblearn
-                    sys.modules['imblearn.over_sampling'] = dummy_imblearn.over_sampling
-                    sys.modules['imblearn.pipeline'] = dummy_imblearn.pipeline
-                    
-                    # Now load the model
+                    # Load model
                     model_data = joblib.load(tmp_path)
-                    
-                    # Check and fix the model structure if needed
-                    if isinstance(model_data.get('svm_model'), BackgroundSubtractionSVM):
-                        if hasattr(model_data['svm_model'], 'svm'):
-                            svm_model = model_data['svm_model'].svm
-                            if svm_model is not None:
-                                model_data['svm_model'] = svm_model
                     
                     # Initialize predictor
                     st.session_state.predictor = ParkingSpotPredictor(model_data)
@@ -408,25 +302,10 @@ def main():
                     # Clean up
                     os.unlink(tmp_path)
                     
-                    st.success("✅ Model loaded successfully!")
+                    st.success(f"✅ Model loaded (Accuracy: {st.session_state.predictor.model_accuracy:.2%})")
                     
-                    # Show model info
-                    with st.expander("Model Information"):
-                        st.write(f"**Accuracy:** {st.session_state.predictor.model_accuracy:.2%}")
-                        st.write(f"**Features:** {len(st.session_state.predictor.feature_names)}")
-                        if st.session_state.predictor.feature_names:
-                            st.write("**Top 5 Features:**")
-                            for name in st.session_state.predictor.feature_names[:5]:
-                                st.write(f"- {name}")
-                
                 except Exception as e:
                     st.error(f"❌ Error loading model: {str(e)}")
-                    st.info("""
-                    **Troubleshooting tips:**
-                    1. Make sure you're using the updated training code
-                    2. The model should be saved without imblearn dependencies
-                    3. Check if all required packages are installed
-                    """)
                     st.session_state.model_loaded = False
         
         st.divider()
@@ -453,18 +332,10 @@ def main():
                 help="Higher values = more conservative (fewer 'occupied' predictions)"
             )
             
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Apply Settings", use_container_width=True):
-                    st.session_state.predictor.set_lighting_mode(lighting_mode)
-                    st.session_state.predictor.adjust_threshold(threshold)
-                    st.success("Settings applied!")
-            
-            with col2:
-                if st.button("Reset to Default", use_container_width=True):
-                    st.session_state.predictor.set_lighting_mode("daylight")
-                    st.session_state.predictor.adjust_threshold(0.5)
-                    st.rerun()
+            if st.button("Apply Settings", use_container_width=True):
+                st.session_state.predictor.set_lighting_mode(lighting_mode)
+                st.session_state.predictor.adjust_threshold(threshold)
+                st.success("Settings applied!")
         
         st.divider()
         
@@ -478,36 +349,26 @@ def main():
         )
         
         if demo_option == "Sample Empty Spot":
-            # Create sample empty spot
             demo_image = np.ones((100, 100, 3), dtype=np.uint8) * 150
             st.session_state.demo_image = demo_image
-            st.session_state.demo_label = "empty"
-            st.info("Demo empty spot loaded. Go to 'Single Spot Prediction' tab.")
+            st.info("Demo empty spot loaded.")
         
         elif demo_option == "Sample Occupied Spot":
-            # Create sample occupied spot
             demo_image = np.ones((100, 100, 3), dtype=np.uint8) * 150
             cv2.rectangle(demo_image, (20, 20), (80, 80), (0, 0, 200), -1)
             st.session_state.demo_image = demo_image
-            st.session_state.demo_label = "occupied"
-            st.info("Demo occupied spot loaded. Go to 'Single Spot Prediction' tab.")
+            st.info("Demo occupied spot loaded.")
         
         st.divider()
         
         # Deployment info
         st.subheader("🌐 Deployment Info")
-        st.info("""
-        **Deployed on:** Streamlit Cloud
-        **Status:** Online
-        **Model:** Parking Detection SVM
-        **Last Updated:** {}
-        """.format(datetime.now().strftime("%Y-%m-%d")))
+        st.info(f"**Last Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     
     # Main content tabs
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2 = st.tabs([
         "🔍 Single Spot Prediction", 
-        "📊 Parking Lot Analysis", 
-        "📈 Model Insights"
+        "📊 Parking Lot Analysis"
     ])
     
     # Tab 1: Single Spot Prediction
@@ -516,22 +377,6 @@ def main():
         
         if not st.session_state.model_loaded:
             st.warning("⚠️ Please upload a trained model in the sidebar first.")
-            
-            col_info1, col_info2 = st.columns(2)
-            with col_info1:
-                st.info("""
-                **How to get started:**
-                1. Train your model using the training code
-                2. Save as `parking_detection_model.pkl`
-                3. Upload it in the sidebar
-                """)
-            
-            with col_info2:
-                st.info("""
-                **Need a model file?**
-                - Make sure to use the updated training code
-                - The model should save only sklearn components
-                """)
         else:
             col_left, col_right = st.columns([1, 1])
             
@@ -548,7 +393,7 @@ def main():
                 # Use demo image if available
                 image_to_predict = None
                 if 'demo_image' in st.session_state:
-                    st.info(f"Using demo image ({st.session_state.demo_label})")
+                    st.info("Using demo image")
                     image_to_predict = st.session_state.demo_image.copy()
                     st.image(cv2.cvtColor(image_to_predict, cv2.COLOR_BGR2RGB),
                             caption="Demo Image",
@@ -570,7 +415,7 @@ def main():
             with col_right:
                 st.subheader("Prediction Results")
                 
-                if 'last_prediction' in st.session_state:
+                if st.session_state.last_prediction:
                     result = st.session_state.last_prediction
                     
                     # Display prediction
@@ -578,7 +423,7 @@ def main():
                         st.markdown(f"""
                         <div class="prediction-box occupied">
                             <h2 style="color: #EF4444; text-align: center;">🚗 OCCUPIED</h2>
-                            <div style="text-align: center; font-size: 24px; margin: 20px 0;">
+                            <div style="text-align: center; font-size: 20px; margin: 15px 0;">
                                 <strong>{result['confidence']:.1%}</strong> confidence
                             </div>
                             <div class="metric-card">
@@ -592,7 +437,7 @@ def main():
                         st.markdown(f"""
                         <div class="prediction-box available">
                             <h2 style="color: #10B981; text-align: center;">🆓 AVAILABLE</h2>
-                            <div style="text-align: center; font-size: 24px; margin: 20px 0;">
+                            <div style="text-align: center; font-size: 20px; margin: 15px 0;">
                                 <strong>{result['confidence']:.1%}</strong> confidence
                             </div>
                             <div class="metric-card">
@@ -603,77 +448,29 @@ def main():
                         </div>
                         """, unsafe_allow_html=True)
                     
-                    # Visualization - FIXED VERSION
+                    # Visualization
                     with st.expander("🔬 Feature Extraction Visualization", expanded=False):
                         col_v1, col_v2, col_v3 = st.columns(3)
                         with col_v1:
                             st.image(cv2.cvtColor(result["processed_image"], cv2.COLOR_BGR2RGB),
                                     caption="Preprocessed", use_container_width=True)
                         with col_v2:
-                            # Handle foreground mask display properly
-                            foreground_mask = result["foreground_mask"]
-                            # Ensure it's a numpy array
-                            if isinstance(foreground_mask, np.ndarray):
-                                # Convert to uint8 if needed
-                                if foreground_mask.dtype != np.uint8:
-                                    foreground_mask = foreground_mask.astype(np.uint8)
-                                # If 3D, convert to grayscale
-                                if len(foreground_mask.shape) == 3:
-                                    if foreground_mask.shape[2] == 3:
-                                        foreground_mask = cv2.cvtColor(foreground_mask, cv2.COLOR_BGR2GRAY)
-                                    elif foreground_mask.shape[2] == 4:
-                                        foreground_mask = cv2.cvtColor(foreground_mask, cv2.COLOR_BGRA2GRAY)
-                                    else:
-                                        # Take first channel if multi-channel
-                                        foreground_mask = foreground_mask[:, :, 0]
-                                # Normalize to 0-255 if values are in 0-1 range
-                                if foreground_mask.max() <= 1.0:
-                                    foreground_mask = (foreground_mask * 255).astype(np.uint8)
-                            st.image(foreground_mask, 
-                                    caption="Foreground Mask", 
-                                    use_container_width=True)
+                            st.image(result["foreground_mask"], 
+                                    caption="Foreground Mask", use_container_width=True)
                         with col_v3:
                             st.image(cv2.cvtColor(result["foreground_image"], cv2.COLOR_BGR2RGB),
                                     caption="Foreground", use_container_width=True)
-                    
-                    # Feature analysis
-                    if result["features"]:
-                        with st.expander("📊 Feature Analysis", expanded=False):
-                            features_df = pd.DataFrame({
-                                "Feature": list(result["features"].keys()),
-                                "Value": list(result["features"].values())
-                            })
-                            
-                            # Bar chart
-                            fig = px.bar(
-                                features_df,
-                                x="Feature",
-                                y="Value",
-                                title="Extracted Feature Values",
-                                color="Value",
-                                color_continuous_scale="Blues"
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-                            
-                            # Download features
-                            csv = features_df.to_csv(index=False)
-                            st.download_button(
-                                label="📥 Download Features (CSV)",
-                                data=csv,
-                                file_name=f"spot_features_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                                mime="text/csv"
-                            )
                 else:
-                    st.info("👈 Upload an image and click 'Predict Occupancy' to see results here")
+                    st.info("👈 Upload an image and click 'Predict Occupancy' to see results")
     
-    # Tab 2: Parking Lot Analysis - UPDATED VERSION
+    # Tab 2: Parking Lot Analysis - SIMPLIFIED
     with tab2:
         st.header("Parking Lot Analysis")
         
         if not st.session_state.model_loaded:
-            st.warning("Please upload a model to use parking lot analysis")
+            st.warning("Please upload a model first")
         else:
-            st.info("Upload a full parking lot image to analyze multiple spots at once")
+            st.info("Upload a full parking lot image to analyze multiple spots")
             
             uploaded_lot = st.file_uploader(
                 "Upload parking lot image",
@@ -692,210 +489,101 @@ def main():
                     # Configuration
                     col_config1, col_config2 = st.columns(2)
                     with col_config1:
-                        rows = st.number_input("Number of Rows", 1, 10, 3)
+                        rows = st.number_input("Number of Rows", 1, 10, 3, key="rows_input")
                     with col_config2:
-                        cols = st.number_input("Spots per Row", 1, 20, 5)
+                        cols = st.number_input("Spots per Row", 1, 20, 5, key="cols_input")
                     
                     if st.button("🔍 Analyze Parking Lot", type="primary", use_container_width=True):
-                        with st.spinner(f"Analyzing {rows}x{cols} spots..."):
-                            # Create spot grid
-                            spots_config = []
-                            spot_width = lot_image.shape[1] // cols
-                            spot_height = lot_image.shape[0] // rows
-                            
-                            for r in range(rows):
-                                for c in range(cols):
-                                    spots_config.append({
-                                        "id": f"R{r+1}C{c+1}",
-                                        "bbox": [c*spot_width, r*spot_height, spot_width, spot_height],
-                                        "position": f"Row {r+1}, Col {c+1}"
-                                    })
-                            
-                            # Analyze each spot
-                            results = []
-                            progress_bar = st.progress(0)
-                            
-                            for i, spot in enumerate(spots_config):
-                                x, y, w, h = spot["bbox"]
-                                spot_img = lot_image[y:y+h, x:x+w]
+                        # Create spot grid
+                        spot_width = lot_image.shape[1] // cols
+                        spot_height = lot_image.shape[0] // rows
+                        
+                        # Analyze each spot with progress
+                        results = []
+                        progress_text = st.empty()
+                        progress_bar = st.progress(0)
+                        
+                        for r in range(rows):
+                            for c in range(cols):
+                                x, y = c * spot_width, r * spot_height
+                                spot_img = lot_image[y:y+spot_height, x:x+spot_width]
                                 
                                 if spot_img.size > 0:
-                                    # For parking lot analysis, we only need the prediction result
-                                    # Not the full visualization data to save memory
-                                    prediction_result = st.session_state.predictor.predict_single_spot(spot_img)
-                                    results.append({
-                                        "id": spot["id"],
-                                        "position": spot["position"],
-                                        "prediction": prediction_result["prediction"],
-                                        "confidence": prediction_result["confidence"],
-                                        "occupied_prob": prediction_result["probability_occupied"]
-                                    })
+                                    try:
+                                        prediction = st.session_state.predictor.predict_single_spot(spot_img)
+                                        results.append({
+                                            "id": f"R{r+1}C{c+1}",
+                                            "position": f"Row {r+1}, Col {c+1}",
+                                            "prediction": prediction["prediction"],
+                                            "confidence": prediction["confidence"],
+                                            "occupied_prob": prediction["probability_occupied"]
+                                        })
+                                    except Exception as e:
+                                        # Skip spots that cause errors
+                                        continue
                                 
-                                progress_bar.progress((i + 1) / len(spots_config))
+                                # Update progress
+                                current_progress = ((r * cols) + c + 1) / (rows * cols)
+                                progress_bar.progress(current_progress)
+                                progress_text.text(f"Analyzing spot {r+1}-{c+1} of {rows}x{cols}")
+                        
+                        progress_text.text("Analysis complete!")
+                        
+                        # Display results
+                        if results:
+                            results_df = pd.DataFrame(results)
                             
-                            # Display results
-                            if results:
-                                results_df = pd.DataFrame(results)
+                            # Summary metrics
+                            occupied = sum(1 for r in results if r["prediction"] == "occupied")
+                            total = len(results)
+                            utilization = occupied / total if total > 0 else 0
+                            
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Total Spots", total)
+                            with col2:
+                                st.metric("Occupied", occupied)
+                            with col3:
+                                st.metric("Available", total - occupied)
+                            
+                            # Visualize on image
+                            overlay = lot_image.copy()
+                            for result in results:
+                                # Parse row and column from id
+                                parts = result["id"][1:].split('C')
+                                r = int(parts[0]) - 1
+                                c = int(parts[1]) - 1
                                 
-                                # Summary metrics
-                                occupied_count = sum(1 for r in results if r["prediction"] == "occupied")
-                                total_spots = len(results)
-                                utilization_rate = occupied_count / total_spots if total_spots > 0 else 0
+                                x, y = c * spot_width, r * spot_height
                                 
-                                col_metric1, col_metric2, col_metric3, col_metric4 = st.columns(4)
-                                with col_metric1:
-                                    st.metric("Total Spots", total_spots)
-                                with col_metric2:
-                                    st.metric("Occupied", occupied_count)
-                                with col_metric3:
-                                    st.metric("Available", total_spots - occupied_count)
-                                with col_metric4:
-                                    st.metric("Utilization", f"{utilization_rate:.1%}")
+                                if result["prediction"] == "occupied":
+                                    color = (0, 0, 255)  # Red
+                                else:
+                                    color = (0, 255, 0)  # Green
                                 
-                                # Visualize on image with color coding
-                                overlay_image = lot_image.copy()
-                                for spot in spots_config:
-                                    x, y, w, h = spot["bbox"]
-                                    spot_result = next((r for r in results if r["id"] == spot["id"]), None)
-                                    
-                                    if spot_result and spot_result["prediction"] == "occupied":
-                                        color = (0, 0, 255)  # Red for occupied
-                                    else:
-                                        color = (0, 255, 0)  # Green for available
-                                    
-                                    # Draw rectangle around spot
-                                    cv2.rectangle(overlay_image, (x, y), (x+w, y+h), color, 2)
-                                    # Add spot ID
-                                    cv2.putText(overlay_image, spot["id"], (x+5, y+20), 
-                                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                                cv2.rectangle(overlay, (x, y), (x+spot_width, y+spot_height), color, 2)
+                                cv2.putText(overlay, result["id"], (x+5, y+20), 
+                                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                            
+                            st.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB),
+                                    caption="Parking Lot Analysis (Red=Occupied, Green=Available)",
+                                    use_container_width=True)
+                            
+                            # Results table
+                            with st.expander("📋 Detailed Results", expanded=False):
+                                st.dataframe(results_df, use_container_width=True)
                                 
-                                st.image(cv2.cvtColor(overlay_image, cv2.COLOR_BGR2RGB),
-                                        caption="Parking Lot Analysis (Red=Occupied, Green=Available)",
-                                        use_container_width=True)
-                                
-                                # Results table
-                                with st.expander("📋 Detailed Results", expanded=False):
-                                    st.dataframe(results_df, use_container_width=True)
-                                    
-                                    # Add visualization of occupancy distribution
-                                    st.subheader("Occupancy Distribution")
-                                    occupancy_df = pd.DataFrame({
-                                        'Status': ['Occupied', 'Available'],
-                                        'Count': [occupied_count, total_spots - occupied_count]
-                                    })
-                                    
-                                    fig = px.pie(occupancy_df, values='Count', names='Status',
-                                                title='Parking Lot Occupancy',
-                                                color='Status',
-                                                color_discrete_map={'Occupied': '#EF4444', 'Available': '#10B981'})
-                                    st.plotly_chart(fig, use_container_width=True)
-                                    
-                                    # Download results
-                                    csv_data = results_df.to_csv(index=False)
-                                    st.download_button(
-                                        label="📥 Download Results (CSV)",
-                                        data=csv_data,
-                                        file_name=f"parking_lot_analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                                        mime="text/csv",
-                                        use_container_width=True
-                                    )
-    
-    # Tab 3: Model Insights
-    with tab3:
-        st.header("Model Performance Insights")
-        
-        if not st.session_state.model_loaded:
-            st.warning("Upload a model to see performance insights")
-        else:
-            col_insight1, col_insight2 = st.columns(2)
-            
-            with col_insight1:
-                st.subheader("Model Information")
-                st.metric("Accuracy", f"{st.session_state.predictor.model_accuracy:.2%}")
-                st.metric("Current Threshold", f"{st.session_state.predictor.current_threshold:.2f}")
-                st.metric("Lighting Mode", st.session_state.predictor.current_lighting_mode)
-                st.metric("Feature Count", len(st.session_state.predictor.feature_names))
-            
-            with col_insight2:
-                st.subheader("Threshold Analysis")
-                st.info("Adjust the threshold in the sidebar to see how it affects predictions")
-                
-                # Show threshold impact
-                thresholds = np.linspace(0.1, 0.9, 9)
-                default_accuracy = st.session_state.predictor.model_accuracy
-                
-                # Simulate accuracy at different thresholds
-                simulated_acc = []
-                for t in thresholds:
-                    # Simple simulation: accuracy decreases as threshold moves away from optimal
-                    optimal = 0.5
-                    diff = abs(t - optimal)
-                    simulated_acc.append(default_accuracy * (1 - diff*0.5))
-                
-                threshold_df = pd.DataFrame({
-                    "Threshold": thresholds,
-                    "Simulated Accuracy": simulated_acc
-                })
-                
-                fig = px.line(
-                    threshold_df,
-                    x="Threshold",
-                    y="Simulated Accuracy",
-                    title="Threshold vs. Accuracy (Simulated)",
-                    markers=True
-                )
-                fig.add_vline(
-                    x=st.session_state.predictor.current_threshold,
-                    line_dash="dash",
-                    line_color="red",
-                    annotation_text=f"Current: {st.session_state.predictor.current_threshold}"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # Feature importance
-            st.subheader("Feature Importance")
-            if st.session_state.predictor.feature_names:
-                # Create simulated importance
-                importance = np.random.rand(len(st.session_state.predictor.feature_names))
-                importance = importance / importance.sum()
-                
-                importance_df = pd.DataFrame({
-                    "Feature": st.session_state.predictor.feature_names,
-                    "Importance": importance
-                }).sort_values("Importance", ascending=False)
-                
-                fig = px.bar(
-                    importance_df.head(10),
-                    x="Importance",
-                    y="Feature",
-                    orientation='h',
-                    title="Top 10 Most Important Features",
-                    color="Importance",
-                    color_continuous_scale="Blues"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # Model recommendations
-            st.subheader("Recommendations")
-            with st.expander("Tips for Better Accuracy", expanded=True):
-                st.info("""
-                **✅ Best Practices:**
-                1. Use consistent lighting conditions
-                2. Keep camera angle stable
-                3. Ensure spots are clearly visible
-                4. Adjust threshold based on lighting
-                
-                **⚡ Quick Settings:**
-                - **Daytime:** Use 'daylight' mode
-                - **Night:** Use 'night' mode with lower threshold
-                - **Overcast:** Use 'overcast' mode
-                - **High Contrast:** Use 'bright_sun' mode
-                
-                **📊 Monitoring:**
-                - Monitor accuracy over time
-                - Adjust threshold based on results
-                - Retrain model with new data periodically
-                """)
+                                # Download results
+                                csv_data = results_df.to_csv(index=False)
+                                st.download_button(
+                                    label="📥 Download Results (CSV)",
+                                    data=csv_data,
+                                    file_name=f"parking_lot_analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                                    mime="text/csv",
+                                    use_container_width=True
+                                )
+                        else:
+                            st.error("No valid spots were analyzed. Try a different image or grid configuration.")
 
 # ============================
 # RUN THE APP
