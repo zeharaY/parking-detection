@@ -357,6 +357,10 @@ def main():
         st.session_state.predictor = None
     if 'model_loaded' not in st.session_state:
         st.session_state.model_loaded = False
+    if 'uploaded_images' not in st.session_state:
+        st.session_state.uploaded_images = []
+    if 'predictions' not in st.session_state:
+        st.session_state.predictions = []
     
     # Sidebar
     with st.sidebar:
@@ -493,8 +497,372 @@ def main():
         **Last Updated:** {}
         """.format(datetime.now().strftime("%Y-%m-%d")))
     
-    # Main content tabs (same as before, unchanged)
-    # ... [Keep all the tab1, tab2, tab3 code exactly as in your original app]
+    # Main content tabs
+    tab1, tab2, tab3 = st.tabs([
+        "📸 Single Spot Prediction",
+        "🏢 Multiple Spots Analysis",
+        "📊 Analytics Dashboard"
+    ])
+    
+    # Tab 1: Single Spot Prediction
+    with tab1:
+        st.header("Single Parking Spot Detection")
+        
+        if not st.session_state.model_loaded:
+            st.warning("⚠️ Please upload a trained model first in the sidebar.")
+            st.info("Upload your model file to start making predictions.")
+        else:
+            col1, col2 = st.columns([1, 1])
+            
+            with col1:
+                st.subheader("Upload Spot Image")
+                
+                # Image upload
+                uploaded_file = st.file_uploader(
+                    "Choose a parking spot image",
+                    type=['jpg', 'jpeg', 'png'],
+                    key="single_spot_upload"
+                )
+                
+                # Use demo image if no upload
+                if uploaded_file is None and hasattr(st.session_state, 'demo_image'):
+                    st.info("Using demo image. Upload your own image or try the demo options in the sidebar.")
+                    image = st.session_state.demo_image.copy()
+                    image_display = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+                    st.image(image_display, caption="Demo Parking Spot", use_column_width=True)
+                elif uploaded_file is not None:
+                    # Read uploaded image
+                    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+                    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                    image_display = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+                    st.image(image_display, caption="Uploaded Parking Spot", use_column_width=True)
+                else:
+                    image = None
+                    st.info("Please upload a parking spot image or select a demo option in the sidebar.")
+                
+                # Prediction button
+                if image is not None:
+                    if st.button("🚀 Predict Occupancy", type="primary", use_container_width=True):
+                        with st.spinner("Analyzing parking spot..."):
+                            # Make prediction
+                            result = st.session_state.predictor.predict_single_spot(image)
+                            
+                            # Store result
+                            st.session_state.single_prediction = result
+                            
+                            # Display result
+                            with col2:
+                                st.subheader("Prediction Result")
+                                
+                                # Color-coded result box
+                                if result["prediction"] == "occupied":
+                                    st.markdown(f"""
+                                    <div class="prediction-box occupied">
+                                        <h3>🚗 Spot is OCCUPIED</h3>
+                                        <p><strong>Confidence:</strong> {result['confidence']:.2%}</p>
+                                        <p><strong>Probability (Occupied):</strong> {result['probability_occupied']:.2%}</p>
+                                        <p><strong>Threshold used:</strong> {result['threshold_used']:.2f}</p>
+                                        <p><strong>Lighting mode:</strong> {result['lighting_mode']}</p>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                else:
+                                    st.markdown(f"""
+                                    <div class="prediction-box available">
+                                        <h3>🅿️ Spot is AVAILABLE</h3>
+                                        <p><strong>Confidence:</strong> {result['confidence']:.2%}</p>
+                                        <p><strong>Probability (Available):</strong> {result['probability_available']:.2%}</p>
+                                        <p><strong>Threshold used:</strong> {result['threshold_used']:.2f}</p>
+                                        <p><strong>Lighting mode:</strong> {result['lighting_mode']}</p>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                
+                                # Visualization
+                                st.subheader("Analysis Visualization")
+                                
+                                # Create tabs for different visualizations
+                                viz_tab1, viz_tab2, viz_tab3 = st.tabs([
+                                    "Original vs Processed",
+                                    "Foreground Mask",
+                                    "Feature Analysis"
+                                ])
+                                
+                                with viz_tab1:
+                                    fig_col1, fig_col2 = st.columns(2)
+                                    with fig_col1:
+                                        st.image(image_display, caption="Original Image", use_column_width=True)
+                                    with fig_col2:
+                                        processed_rgb = cv2.cvtColor(result["processed_image"], cv2.COLOR_BGR2RGB)
+                                        st.image(processed_rgb, caption="Processed Image", use_column_width=True)
+                                
+                                with viz_tab2:
+                                    mask_col1, mask_col2 = st.columns(2)
+                                    with mask_col1:
+                                        st.image(result["foreground_mask"], caption="Foreground Mask", use_column_width=True, clamp=True)
+                                    with mask_col2:
+                                        foreground_rgb = cv2.cvtColor(result["foreground_image"], cv2.COLOR_BGR2RGB)
+                                        st.image(foreground_rgb, caption="Foreground Image", use_column_width=True)
+                                
+                                with viz_tab3:
+                                    if result["features"]:
+                                        features_df = pd.DataFrame.from_dict(result["features"], orient='index', columns=['Value'])
+                                        st.dataframe(features_df.style.highlight_max(axis=0))
+                                        
+                                        # Bar chart of top features
+                                        top_features = dict(sorted(result["features"].items(), key=lambda x: abs(x[1]), reverse=True)[:10])
+                                        fig = px.bar(
+                                            x=list(top_features.keys()),
+                                            y=list(top_features.values()),
+                                            title="Top 10 Feature Values",
+                                            labels={'x': 'Feature', 'y': 'Value'}
+                                        )
+                                        st.plotly_chart(fig, use_container_width=True)
+                                    
+                                # Download results
+                                st.subheader("Export Results")
+                                result_json = json.dumps(result, default=str, indent=2)
+                                st.download_button(
+                                    label="📥 Download Prediction Data (JSON)",
+                                    data=result_json,
+                                    file_name=f"parking_prediction_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                                    mime="application/json"
+                                )
+            
+            if not st.session_state.get('single_prediction'):
+                with col2:
+                    st.info("👈 Upload an image and click 'Predict Occupancy' to see results here")
+    
+    # Tab 2: Multiple Spots Analysis
+    with tab2:
+        st.header("Multiple Parking Spots Analysis")
+        
+        if not st.session_state.model_loaded:
+            st.warning("⚠️ Please upload a trained model first in the sidebar.")
+        else:
+            st.subheader("Upload Multiple Spot Images")
+            
+            # Multiple file upload
+            uploaded_files = st.file_uploader(
+                "Upload multiple parking spot images",
+                type=['jpg', 'jpeg', 'png'],
+                accept_multiple_files=True,
+                key="multiple_spots_upload"
+            )
+            
+            if uploaded_files:
+                # Store uploaded images
+                st.session_state.uploaded_images = []
+                for uploaded_file in uploaded_files:
+                    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+                    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                    st.session_state.uploaded_images.append({
+                        'name': uploaded_file.name,
+                        'image': image
+                    })
+                
+                # Display uploaded images
+                st.write(f"**Uploaded {len(uploaded_files)} images**")
+                
+                cols = st.columns(min(4, len(uploaded_files)))
+                for idx, img_data in enumerate(st.session_state.uploaded_images):
+                    with cols[idx % 4]:
+                        image_display = Image.fromarray(cv2.cvtColor(img_data['image'], cv2.COLOR_BGR2RGB))
+                        st.image(image_display, caption=img_data['name'][:20], use_column_width=True)
+                
+                # Batch prediction button
+                if st.button("🔍 Analyze All Spots", type="primary", use_container_width=True):
+                    with st.spinner(f"Analyzing {len(uploaded_files)} parking spots..."):
+                        predictions = []
+                        progress_bar = st.progress(0)
+                        
+                        for idx, img_data in enumerate(st.session_state.uploaded_images):
+                            result = st.session_state.predictor.predict_single_spot(img_data['image'])
+                            result['name'] = img_data['name']
+                            predictions.append(result)
+                            progress_bar.progress((idx + 1) / len(st.session_state.uploaded_images))
+                        
+                        st.session_state.predictions = predictions
+                        
+                        # Display summary
+                        st.success(f"✅ Analysis complete! Processed {len(predictions)} spots.")
+                        
+                        # Summary statistics
+                        occupied_count = sum(1 for p in predictions if p['prediction'] == 'occupied')
+                        available_count = len(predictions) - occupied_count
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Total Spots", len(predictions))
+                        with col2:
+                            st.metric("Occupied", occupied_count, delta=None)
+                        with col3:
+                            st.metric("Available", available_count, delta=None)
+                        
+                        # Results table
+                        st.subheader("Detailed Results")
+                        results_data = []
+                        for pred in predictions:
+                            results_data.append({
+                                'Spot Name': pred['name'],
+                                'Status': pred['prediction'],
+                                'Confidence': f"{pred['confidence']:.2%}",
+                                'Probability (Occupied)': f"{pred['probability_occupied']:.2%}",
+                                'Lighting Mode': pred['lighting_mode']
+                            })
+                        
+                        results_df = pd.DataFrame(results_data)
+                        st.dataframe(results_df, use_container_width=True)
+                        
+                        # Visualization
+                        st.subheader("Visualizations")
+                        
+                        # Pie chart
+                        fig = px.pie(
+                            names=['Occupied', 'Available'],
+                            values=[occupied_count, available_count],
+                            title="Parking Spot Occupancy Distribution",
+                            color=['Occupied', 'Available'],
+                            color_discrete_map={'Occupied': '#EF4444', 'Available': '#10B981'}
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Confidence distribution
+                        confidences = [p['confidence'] for p in predictions]
+                        fig2 = px.histogram(
+                            x=confidences,
+                            nbins=20,
+                            title="Confidence Distribution",
+                            labels={'x': 'Confidence', 'y': 'Count'}
+                        )
+                        st.plotly_chart(fig2, use_container_width=True)
+                        
+                        # Download all results
+                        st.subheader("Export All Results")
+                        all_results = {
+                            'timestamp': datetime.now().isoformat(),
+                            'model_accuracy': st.session_state.predictor.model_accuracy,
+                            'lighting_mode': st.session_state.predictor.current_lighting_mode,
+                            'threshold': st.session_state.predictor.current_threshold,
+                            'predictions': predictions
+                        }
+                        
+                        all_results_json = json.dumps(all_results, default=str, indent=2)
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.download_button(
+                                label="📥 Download All Results (JSON)",
+                                data=all_results_json,
+                                file_name=f"parking_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                                mime="application/json",
+                                use_container_width=True
+                            )
+                        
+                        with col2:
+                            # Export as CSV
+                            csv_data = results_df.to_csv(index=False)
+                            st.download_button(
+                                label="📊 Download Results (CSV)",
+                                data=csv_data,
+                                file_name=f"parking_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv",
+                                use_container_width=True
+                            )
+            else:
+                st.info("👆 Upload multiple parking spot images to analyze them in batch")
+    
+    # Tab 3: Analytics Dashboard
+    with tab3:
+        st.header("Analytics Dashboard")
+        
+        if not st.session_state.model_loaded:
+            st.warning("⚠️ Please upload a trained model first in the sidebar.")
+        else:
+            st.subheader("Model Performance")
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric(
+                    "Model Accuracy",
+                    f"{st.session_state.predictor.model_accuracy:.2%}",
+                    help="Accuracy of the trained model on test data"
+                )
+            
+            with col2:
+                st.metric(
+                    "Feature Count",
+                    len(st.session_state.predictor.feature_names),
+                    help="Number of features used by the model"
+                )
+            
+            with col3:
+                st.metric(
+                    "Current Threshold",
+                    f"{st.session_state.predictor.current_threshold:.2f}",
+                    help="Current classification threshold"
+                )
+            
+            # Model information
+            with st.expander("Model Details", expanded=True):
+                if st.session_state.predictor.feature_names:
+                    st.write("**Feature Importance** (if available):")
+                    # Create a placeholder for feature importance visualization
+                    features_df = pd.DataFrame({
+                        'Feature': st.session_state.predictor.feature_names,
+                        'Importance': np.random.rand(len(st.session_state.predictor.feature_names))  # Placeholder
+                    })
+                    features_df = features_df.sort_values('Importance', ascending=False).head(10)
+                    
+                    fig = px.bar(
+                        features_df,
+                        x='Importance',
+                        y='Feature',
+                        orientation='h',
+                        title="Top 10 Features (Sample Importance)",
+                        color='Importance',
+                        color_continuous_scale='Viridis'
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Feature names not available in the model")
+            
+            # Historical predictions (if available)
+            if hasattr(st.session_state, 'predictions') and st.session_state.predictions:
+                st.subheader("Recent Predictions Analysis")
+                
+                # Calculate statistics
+                total_predictions = len(st.session_state.predictions)
+                if total_predictions > 0:
+                    occupied_pct = sum(1 for p in st.session_state.predictions if p['prediction'] == 'occupied') / total_predictions
+                    avg_confidence = np.mean([p['confidence'] for p in st.session_state.predictions])
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Average Occupancy Rate", f"{occupied_pct:.2%}")
+                    with col2:
+                        st.metric("Average Confidence", f"{avg_confidence:.2%}")
+                    
+                    # Time series of predictions (simulated)
+                    st.write("**Prediction Trends** (Last 24 hours - simulated)")
+                    times = pd.date_range(end=datetime.now(), periods=24, freq='H')
+                    simulated_occupancy = np.random.rand(24) * 0.3 + 0.4  # Simulated data
+                    
+                    trend_df = pd.DataFrame({
+                        'Time': times,
+                        'Occupancy Rate': simulated_occupancy
+                    })
+                    
+                    fig = px.line(
+                        trend_df,
+                        x='Time',
+                        y='Occupancy Rate',
+                        title="Parking Occupancy Trends",
+                        markers=True
+                    )
+                    fig.update_yaxes(tickformat=".0%")
+                    st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Make some predictions in the previous tabs to see analytics here")
 
 # ============================
 # RUN THE APP
