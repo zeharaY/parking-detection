@@ -21,31 +21,14 @@ from collections import defaultdict
 import tempfile
 import os
 import sys
+import types
 
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
 # ============================
-# DUMMY IMBLEARN MODULE TO AVOID IMPORT ERRORS
-# ============================
-# Create dummy classes to prevent import errors when loading the pickled model
-class DummySMOTE:
-    def __init__(self, **kwargs):
-        pass
-
-class DummyImbPipeline:
-    def __init__(self, steps):
-        self.steps = steps
-    def fit(self, X, y):
-        return self
-    def predict(self, X):
-        pass
-    def predict_proba(self, X):
-        pass
-
-# ============================
-# SIMPLIFIED SVM CLASSIFIER CLASS (FOR INFERENCE ONLY)
+# SIMPLIFIED SVM CLASSIFIER CLASS
 # ============================
 class BackgroundSubtractionSVM:
     """
@@ -72,7 +55,6 @@ class BackgroundSubtractionSVM:
 
 # ============================
 # CUSTOM BACKGROUND SUBTRACTOR CLASS
-# (Must match the training code)
 # ============================
 class BackgroundSubtractor:
     """
@@ -196,14 +178,8 @@ class ParkingSpotPredictor:
     
     def __init__(self, model_data):
         """Initialize predictor with trained model"""
-        # Extract the actual SVM model from the custom class if needed
-        if hasattr(model_data['svm_model'], 'svm'):
-            # If it's our custom BackgroundSubtractionSVM class
-            self.model = model_data['svm_model'].svm
-        else:
-            # If it's already a trained sklearn model
-            self.model = model_data['svm_model']
-            
+        # Directly use the saved model - it should be a trained sklearn model
+        self.model = model_data['svm_model']
         self.bg_subtractor = model_data['bg_subtractor']
         self.feature_names = model_data.get('feature_names', [])
         self.model_accuracy = model_data.get('accuracy', 0.0)
@@ -268,9 +244,8 @@ class ParkingSpotPredictor:
         features, mask, foreground = self.extract_features(processed_image)
         features_reshaped = features.reshape(1, -1)
         
-        # Scale features if needed
+        # Scale features if model is a pipeline with scaler
         if hasattr(self.model, 'named_steps') and 'scaler' in self.model.named_steps:
-            # If model is a pipeline with scaler
             features_reshaped = self.model.named_steps['scaler'].transform(features_reshaped)
         
         if hasattr(self.model, 'predict_proba'):
@@ -393,12 +368,23 @@ def main():
                         tmp.write(uploaded_model.getvalue())
                         tmp_path = tmp.name
                     
-                    # Add dummy imblearn module to sys.modules before loading
-                    import types
+                    # Create dummy imblearn module to avoid import errors
                     dummy_imblearn = types.ModuleType('imblearn')
                     dummy_imblearn.over_sampling = types.ModuleType('imblearn.over_sampling')
-                    dummy_imblearn.over_sampling.SMOTE = DummySMOTE
                     dummy_imblearn.pipeline = types.ModuleType('imblearn.pipeline')
+                    
+                    # Create dummy classes
+                    class DummySMOTE:
+                        def __init__(self, **kwargs):
+                            pass
+                    
+                    class DummyImbPipeline:
+                        def __init__(self, steps):
+                            self.steps = steps
+                        def fit(self, X, y):
+                            return self
+                    
+                    dummy_imblearn.over_sampling.SMOTE = DummySMOTE
                     dummy_imblearn.pipeline.Pipeline = DummyImbPipeline
                     
                     sys.modules['imblearn'] = dummy_imblearn
@@ -410,13 +396,10 @@ def main():
                     
                     # Check and fix the model structure if needed
                     if isinstance(model_data.get('svm_model'), BackgroundSubtractionSVM):
-                        # If it's our custom class, extract the actual model
                         if hasattr(model_data['svm_model'], 'svm'):
-                            # The actual sklearn model is stored in .svm attribute
                             svm_model = model_data['svm_model'].svm
-                            if svm_model is None:
-                                raise ValueError("Model not properly trained")
-                            model_data['svm_model'] = svm_model
+                            if svm_model is not None:
+                                model_data['svm_model'] = svm_model
                     
                     # Initialize predictor
                     st.session_state.predictor = ParkingSpotPredictor(model_data)
@@ -440,9 +423,9 @@ def main():
                     st.error(f"❌ Error loading model: {str(e)}")
                     st.info("""
                     **Troubleshooting tips:**
-                    1. Make sure you're using the correct model file
-                    2. Train a new model using the updated training code
-                    3. Check if all dependencies are installed
+                    1. Make sure you're using the updated training code
+                    2. The model should be saved without imblearn dependencies
+                    3. Check if all required packages are installed
                     """)
                     st.session_state.model_loaded = False
         
@@ -620,18 +603,38 @@ def main():
                         </div>
                         """, unsafe_allow_html=True)
                     
-                    # Visualization
+                    # Visualization - FIXED VERSION
                     with st.expander("🔬 Feature Extraction Visualization", expanded=False):
                         col_v1, col_v2, col_v3 = st.columns(3)
                         with col_v1:
                             st.image(cv2.cvtColor(result["processed_image"], cv2.COLOR_BGR2RGB),
-                                    caption="Preprocessed", use_column_width=True)
+                                    caption="Preprocessed", use_container_width=True)
                         with col_v2:
-                            st.image(result["foreground_mask"], 
-                                    caption="Foreground Mask", use_column_width=True, cmap="gray")
+                            # Handle foreground mask display properly
+                            foreground_mask = result["foreground_mask"]
+                            # Ensure it's a numpy array
+                            if isinstance(foreground_mask, np.ndarray):
+                                # Convert to uint8 if needed
+                                if foreground_mask.dtype != np.uint8:
+                                    foreground_mask = foreground_mask.astype(np.uint8)
+                                # If 3D, convert to grayscale
+                                if len(foreground_mask.shape) == 3:
+                                    if foreground_mask.shape[2] == 3:
+                                        foreground_mask = cv2.cvtColor(foreground_mask, cv2.COLOR_BGR2GRAY)
+                                    elif foreground_mask.shape[2] == 4:
+                                        foreground_mask = cv2.cvtColor(foreground_mask, cv2.COLOR_BGRA2GRAY)
+                                    else:
+                                        # Take first channel if multi-channel
+                                        foreground_mask = foreground_mask[:, :, 0]
+                                # Normalize to 0-255 if values are in 0-1 range
+                                if foreground_mask.max() <= 1.0:
+                                    foreground_mask = (foreground_mask * 255).astype(np.uint8)
+                            st.image(foreground_mask, 
+                                    caption="Foreground Mask", 
+                                    use_container_width=True)
                         with col_v3:
                             st.image(cv2.cvtColor(result["foreground_image"], cv2.COLOR_BGR2RGB),
-                                    caption="Foreground", use_column_width=True)
+                                    caption="Foreground", use_container_width=True)
                     
                     # Feature analysis
                     if result["features"]:
@@ -663,7 +666,7 @@ def main():
                 else:
                     st.info("👈 Upload an image and click 'Predict Occupancy' to see results here")
     
-    # Tab 2: Parking Lot Analysis
+    # Tab 2: Parking Lot Analysis - UPDATED VERSION
     with tab2:
         st.header("Parking Lot Analysis")
         
@@ -717,13 +720,15 @@ def main():
                                 spot_img = lot_image[y:y+h, x:x+w]
                                 
                                 if spot_img.size > 0:
-                                    prediction = st.session_state.predictor.predict_single_spot(spot_img)
+                                    # For parking lot analysis, we only need the prediction result
+                                    # Not the full visualization data to save memory
+                                    prediction_result = st.session_state.predictor.predict_single_spot(spot_img)
                                     results.append({
                                         "id": spot["id"],
                                         "position": spot["position"],
-                                        "prediction": prediction["prediction"],
-                                        "confidence": prediction["confidence"],
-                                        "occupied_prob": prediction["probability_occupied"]
+                                        "prediction": prediction_result["prediction"],
+                                        "confidence": prediction_result["confidence"],
+                                        "occupied_prob": prediction_result["probability_occupied"]
                                     })
                                 
                                 progress_bar.progress((i + 1) / len(spots_config))
@@ -733,42 +738,57 @@ def main():
                                 results_df = pd.DataFrame(results)
                                 
                                 # Summary metrics
-                                occupied = sum(1 for r in results if r["prediction"] == "occupied")
-                                total = len(results)
-                                utilization = occupied / total if total > 0 else 0
+                                occupied_count = sum(1 for r in results if r["prediction"] == "occupied")
+                                total_spots = len(results)
+                                utilization_rate = occupied_count / total_spots if total_spots > 0 else 0
                                 
                                 col_metric1, col_metric2, col_metric3, col_metric4 = st.columns(4)
                                 with col_metric1:
-                                    st.metric("Total Spots", total)
+                                    st.metric("Total Spots", total_spots)
                                 with col_metric2:
-                                    st.metric("Occupied", occupied)
+                                    st.metric("Occupied", occupied_count)
                                 with col_metric3:
-                                    st.metric("Available", total - occupied)
+                                    st.metric("Available", total_spots - occupied_count)
                                 with col_metric4:
-                                    st.metric("Utilization", f"{utilization:.1%}")
+                                    st.metric("Utilization", f"{utilization_rate:.1%}")
                                 
-                                # Visualize on image
-                                overlay = lot_image.copy()
+                                # Visualize on image with color coding
+                                overlay_image = lot_image.copy()
                                 for spot in spots_config:
                                     x, y, w, h = spot["bbox"]
-                                    result = next((r for r in results if r["id"] == spot["id"]), None)
+                                    spot_result = next((r for r in results if r["id"] == spot["id"]), None)
                                     
-                                    if result and result["prediction"] == "occupied":
-                                        color = (0, 0, 255)  # Red
+                                    if spot_result and spot_result["prediction"] == "occupied":
+                                        color = (0, 0, 255)  # Red for occupied
                                     else:
-                                        color = (0, 255, 0)  # Green
+                                        color = (0, 255, 0)  # Green for available
                                     
-                                    cv2.rectangle(overlay, (x, y), (x+w, y+h), color, 2)
-                                    cv2.putText(overlay, spot["id"], (x+5, y+20), 
+                                    # Draw rectangle around spot
+                                    cv2.rectangle(overlay_image, (x, y), (x+w, y+h), color, 2)
+                                    # Add spot ID
+                                    cv2.putText(overlay_image, spot["id"], (x+5, y+20), 
                                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                                 
-                                st.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB),
+                                st.image(cv2.cvtColor(overlay_image, cv2.COLOR_BGR2RGB),
                                         caption="Parking Lot Analysis (Red=Occupied, Green=Available)",
                                         use_container_width=True)
                                 
                                 # Results table
                                 with st.expander("📋 Detailed Results", expanded=False):
                                     st.dataframe(results_df, use_container_width=True)
+                                    
+                                    # Add visualization of occupancy distribution
+                                    st.subheader("Occupancy Distribution")
+                                    occupancy_df = pd.DataFrame({
+                                        'Status': ['Occupied', 'Available'],
+                                        'Count': [occupied_count, total_spots - occupied_count]
+                                    })
+                                    
+                                    fig = px.pie(occupancy_df, values='Count', names='Status',
+                                                title='Parking Lot Occupancy',
+                                                color='Status',
+                                                color_discrete_map={'Occupied': '#EF4444', 'Available': '#10B981'})
+                                    st.plotly_chart(fig, use_container_width=True)
                                     
                                     # Download results
                                     csv_data = results_df.to_csv(index=False)
