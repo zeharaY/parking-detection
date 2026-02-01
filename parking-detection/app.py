@@ -1,5 +1,5 @@
 """
-🚗 Parking Spot Detection App - Fixed Image Loading Issue
+🚗 Parking Spot Detection App with Video Support
 """
 
 import streamlit as st
@@ -14,6 +14,8 @@ import os
 import sys
 import traceback
 import io
+from PIL import Image
+import time
 
 # ============================
 # BACKGROUND SUBTRACTOR (MATCHES TRAINING CODE)
@@ -133,13 +135,238 @@ class BackgroundSubtractor:
         return np.array(features)
 
 # ============================
+# VIDEO PROCESSOR CLASS
+# ============================
+class VideoParkingAnalyzer:
+    """Class for processing parking videos"""
+    
+    def __init__(self, predictor, parking_spots=None):
+        """
+        Initialize video analyzer
+        
+        Args:
+            predictor: ParkingSpotPredictor instance
+            parking_spots: List of parking spot coordinates [(x1,y1,x2,y2), ...]
+                         If None, will auto-detect spots
+        """
+        self.predictor = predictor
+        self.parking_spots = parking_spots
+        self.spot_history = {}  # Store prediction history for each spot
+        
+    def detect_parking_spots_auto(self, frame, rows=3, cols=5):
+        """Automatically detect parking spots in grid pattern"""
+        height, width = frame.shape[:2]
+        spot_width = width // cols
+        spot_height = height // rows
+        
+        spots = []
+        for r in range(rows):
+            for c in range(cols):
+                x1 = c * spot_width
+                y1 = r * spot_height
+                x2 = x1 + spot_width
+                y2 = y1 + spot_height
+                spots.append({
+                    'id': f'R{r+1}C{c+1}',
+                    'bbox': (x1, y1, x2, y2),
+                    'coords': (x1, y1, spot_width, spot_height)
+                })
+        
+        return spots
+    
+    def process_frame(self, frame, frame_number, visualize=True):
+        """Process a single video frame"""
+        if self.parking_spots is None:
+            # Auto-detect spots on first frame
+            self.parking_spots = self.detect_parking_spots_auto(frame, rows=3, cols=5)
+        
+        results = []
+        overlay_frame = frame.copy() if visualize else None
+        
+        for spot in self.parking_spots:
+            spot_id = spot['id']
+            x1, y1, x2, y2 = spot['bbox']
+            x, y, w, h = spot['coords']
+            
+            # Extract spot from frame
+            spot_img = frame[y1:y2, x1:x2]
+            
+            if spot_img.size == 0:
+                continue
+            
+            # Predict occupancy
+            prediction_result = self.predictor.predict_single_spot(spot_img)
+            
+            # Store result
+            result = {
+                'frame': frame_number,
+                'spot_id': spot_id,
+                'prediction': prediction_result['prediction'],
+                'confidence': prediction_result['confidence'],
+                'occupied_prob': prediction_result['probability_occupied'],
+                'available_prob': prediction_result['probability_available'],
+                'x': x1,
+                'y': y1,
+                'width': w,
+                'height': h
+            }
+            results.append(result)
+            
+            # Update history
+            if spot_id not in self.spot_history:
+                self.spot_history[spot_id] = []
+            self.spot_history[spot_id].append({
+                'frame': frame_number,
+                'prediction': prediction_result['prediction'],
+                'confidence': prediction_result['confidence']
+            })
+            
+            # Visualize on frame
+            if visualize:
+                # Set color based on prediction
+                if prediction_result['prediction'] == 'occupied':
+                    color = (0, 0, 255)  # Red
+                    label = f"{spot_id}: Occupied ({prediction_result['confidence']:.1%})"
+                else:
+                    color = (0, 255, 0)  # Green
+                    label = f"{spot_id}: Available ({prediction_result['confidence']:.1%})"
+                
+                # Draw rectangle
+                cv2.rectangle(overlay_frame, (x1, y1), (x2, y2), color, 2)
+                
+                # Add spot ID and status
+                cv2.putText(overlay_frame, label, (x1 + 5, y1 + 20),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        return results, overlay_frame if visualize else frame
+    
+    def process_video(self, video_path, frame_interval=10, max_frames=100):
+        """Process entire video file"""
+        cap = cv2.VideoCapture(video_path)
+        
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open video file: {video_path}")
+        
+        # Get video properties
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / fps if fps > 0 else 0
+        
+        st.info(f"Video Info: {fps} FPS, {total_frames} frames, {duration:.1f} seconds")
+        
+        # Limit frames to process
+        frames_to_process = min(total_frames, max_frames)
+        
+        all_results = []
+        processed_frames = []
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        frame_count = 0
+        processed_count = 0
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret or processed_count >= frames_to_process:
+                break
+            
+            frame_count += 1
+            
+            # Process every nth frame (to speed up processing)
+            if frame_count % frame_interval == 0:
+                status_text.text(f"Processing frame {frame_count}/{frames_to_process}...")
+                
+                # Process frame
+                results, overlay_frame = self.process_frame(frame, frame_count, visualize=True)
+                all_results.extend(results)
+                processed_frames.append({
+                    'frame_number': frame_count,
+                    'frame': overlay_frame,
+                    'results': results
+                })
+                
+                processed_count += 1
+                
+                # Update progress
+                progress = processed_count / frames_to_process
+                progress_bar.progress(progress)
+        
+        cap.release()
+        status_text.text(f"✅ Processed {processed_count} frames")
+        
+        return {
+            'all_results': all_results,
+            'processed_frames': processed_frames,
+            'video_info': {
+                'fps': fps,
+                'total_frames': total_frames,
+                'processed_frames': processed_count,
+                'duration': duration
+            }
+        }
+    
+    def generate_summary_stats(self, results):
+        """Generate summary statistics from video results"""
+        if not results:
+            return None
+        
+        df = pd.DataFrame(results)
+        
+        # Overall statistics
+        total_spots = len(df['spot_id'].unique())
+        total_frames = len(df['frame'].unique())
+        
+        # Average occupancy per frame
+        occupancy_by_frame = df.groupby('frame')['prediction'].apply(
+            lambda x: (x == 'occupied').sum() / len(x)
+        )
+        
+        avg_occupancy = occupancy_by_frame.mean()
+        max_occupancy = occupancy_by_frame.max()
+        min_occupancy = occupancy_by_frame.min()
+        
+        # Spot-level statistics
+        spot_stats = df.groupby('spot_id').agg({
+            'prediction': lambda x: (x == 'occupied').mean(),
+            'confidence': 'mean',
+            'occupied_prob': 'mean'
+        }).reset_index()
+        
+        spot_stats.columns = ['spot_id', 'occupancy_rate', 'avg_confidence', 'avg_occupied_prob']
+        
+        # Time series data for plotting
+        time_series = df.groupby('frame').agg({
+            'prediction': lambda x: (x == 'occupied').sum(),
+            'spot_id': 'count'
+        }).reset_index()
+        
+        time_series.columns = ['frame', 'occupied_count', 'total_spots']
+        time_series['occupancy_rate'] = time_series['occupied_count'] / time_series['total_spots']
+        
+        return {
+            'overall': {
+                'total_spots': total_spots,
+                'total_frames': total_frames,
+                'avg_occupancy': avg_occupancy,
+                'max_occupancy': max_occupancy,
+                'min_occupancy': min_occupancy,
+                'most_occupied_frame': occupancy_by_frame.idxmax(),
+                'least_occupied_frame': occupancy_by_frame.idxmin()
+            },
+            'spot_stats': spot_stats,
+            'time_series': time_series,
+            'raw_data': df
+        }
+
+# ============================
 # MODEL LOADER
 # ============================
 def load_model_safely(model_file):
     """Load model with comprehensive error handling"""
     try:
         return joblib.load(model_file)
-    except Exception as e:
+    except Exception:
         # Create dummy imblearn classes
         class DummySMOTE:
             def __init__(self, **kwargs):
@@ -241,7 +468,7 @@ class ParkingSpotPredictor:
             if hasattr(self.model, 'named_steps') and 'scaler' in self.model.named_steps:
                 try:
                     features_reshaped = self.model.named_steps['scaler'].transform(features_reshaped)
-                except ValueError as e:
+                except ValueError:
                     # Adjust feature count if mismatch
                     if features.shape[0] != 13:
                         if features.shape[0] > 13:
@@ -295,36 +522,7 @@ class ParkingSpotPredictor:
             }
 
 # ============================
-# IMAGE HANDLING UTILITIES
-# ============================
-def load_image_from_upload(uploaded_file):
-    """Load image from uploaded file and cache it"""
-    if uploaded_file is None:
-        return None
-    
-    # Reset file pointer to beginning
-    uploaded_file.seek(0)
-    
-    # Read bytes
-    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    
-    # Decode image
-    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    
-    # Reset file pointer again for future reads
-    uploaded_file.seek(0)
-    
-    return image
-
-def clear_uploaded_files():
-    """Clear uploaded files from session state"""
-    if 'uploaded_image' in st.session_state:
-        del st.session_state.uploaded_image
-    if 'uploaded_lot' in st.session_state:
-        del st.session_state.uploaded_lot
-
-# ============================
-# STREAMLIT APP
+# STREAMLIT APP WITH VIDEO SUPPORT
 # ============================
 def main():
     st.set_page_config(
@@ -361,50 +559,41 @@ def main():
         background-color: rgba(16, 185, 129, 0.1); 
         border-left: 5px solid #10B981; 
     }
-    .error { 
-        background-color: rgba(245, 158, 11, 0.1); 
-        border-left: 5px solid #F59E0B; 
-    }
     .info-box { 
         background-color: #F3F4F6; 
         padding: 15px; 
         border-radius: 10px; 
         margin: 10px 0; 
     }
-    .clear-button {
+    .video-container {
+        position: relative;
+        max-width: 800px;
+        margin: 0 auto;
+    }
+    .video-controls {
+        display: flex;
+        gap: 10px;
         margin-top: 10px;
-        margin-bottom: 10px;
+        margin-bottom: 20px;
     }
     </style>
     """, unsafe_allow_html=True)
     
-    st.markdown('<h1 class="main-header">🚗 Parking Spot Detection</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🚗 Parking Spot Detection with Video Support</h1>', unsafe_allow_html=True)
     
     # Initialize session state
     if 'predictor' not in st.session_state:
         st.session_state.predictor = None
     if 'model_loaded' not in st.session_state:
         st.session_state.model_loaded = False
-    if 'current_image' not in st.session_state:
-        st.session_state.current_image = None
-    if 'current_lot_image' not in st.session_state:
-        st.session_state.current_lot_image = None
-    if 'last_result' not in st.session_state:
-        st.session_state.last_result = None
+    if 'video_analyzer' not in st.session_state:
+        st.session_state.video_analyzer = None
+    if 'video_results' not in st.session_state:
+        st.session_state.video_results = None
     
     # Sidebar
     with st.sidebar:
         st.markdown('<h3 class="sub-header">Configuration</h3>', unsafe_allow_html=True)
-        
-        # Clear button
-        if st.button("🔄 Clear All", type="secondary", use_container_width=True):
-            clear_uploaded_files()
-            st.session_state.current_image = None
-            st.session_state.current_lot_image = None
-            st.session_state.last_result = None
-            st.rerun()
-        
-        st.divider()
         
         # Model upload
         uploaded_model = st.file_uploader("Upload Trained Model (.pkl)", type=['pkl'], key="model_uploader")
@@ -439,76 +628,56 @@ def main():
             threshold = st.slider("Confidence Threshold", 0.0, 1.0, 
                                  st.session_state.predictor.current_threshold, 0.01)
             st.session_state.predictor.current_threshold = threshold
+            
+            # Video processing settings
+            st.divider()
+            st.markdown("### Video Settings")
+            frame_interval = st.slider("Frame interval", 1, 30, 10, 
+                                      help="Process every Nth frame (higher = faster)")
+            max_frames = st.slider("Max frames to process", 10, 500, 100,
+                                  help="Limit processing for long videos")
     
-    # Main content tabs
-    tab1, tab2 = st.tabs(["🔍 Single Spot Analysis", "📊 Parking Lot Analysis"])
+    # Main content tabs - ADDED VIDEO TAB
+    tab1, tab2, tab3 = st.tabs(["🔍 Single Spot", "📊 Parking Lot", "🎥 Video Analysis"])
     
-    # Tab 1: Single Spot
+    # Tab 1: Single Spot (same as before, simplified)
     with tab1:
         st.markdown('<h2 class="sub-header">Single Spot Analysis</h2>', unsafe_allow_html=True)
         
         if not st.session_state.model_loaded:
-            st.info("👈 Please upload a trained model file in the sidebar")
+            st.info("👈 Please upload a trained model file")
         else:
             col1, col2 = st.columns(2)
             
             with col1:
-                st.markdown("### Upload Spot Image")
-                
-                # Use unique key for file uploader
-                uploaded_image = st.file_uploader("Choose an image...", 
+                uploaded_image = st.file_uploader("Choose spot image...", 
                                                  type=['jpg', 'jpeg', 'png'],
-                                                 key="single_spot_uploader")
+                                                 key="single_spot")
                 
-                # Load and display image
-                if uploaded_image is not None:
-                    # Load image and store in session state
-                    st.session_state.current_image = load_image_from_upload(uploaded_image)
+                if uploaded_image:
+                    file_bytes = np.asarray(bytearray(uploaded_image.read()), dtype=np.uint8)
+                    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
                     
-                    if st.session_state.current_image is not None:
-                        st.image(cv2.cvtColor(st.session_state.current_image, cv2.COLOR_BGR2RGB), 
+                    if image is not None:
+                        st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), 
                                 caption="Uploaded Image", use_container_width=True)
                         
-                        # Clear previous results when new image is uploaded
-                        if 'new_image_uploaded' not in st.session_state:
-                            st.session_state.last_result = None
-                            st.session_state.new_image_uploaded = True
-                
-                # Prediction button
-                if st.session_state.current_image is not None:
-                    if st.button("🔮 Analyze This Spot", type="primary", use_container_width=True):
-                        with st.spinner("Analyzing..."):
-                            result = st.session_state.predictor.predict_single_spot(st.session_state.current_image)
-                            st.session_state.last_result = result
-                            # Reset the new image flag
-                            if 'new_image_uploaded' in st.session_state:
-                                del st.session_state.new_image_uploaded
+                        if st.button("🔮 Analyze This Spot", type="primary"):
+                            with st.spinner("Analyzing..."):
+                                result = st.session_state.predictor.predict_single_spot(image)
+                                st.session_state.last_result = result
             
             with col2:
-                st.markdown("### Prediction Results")
-                
-                if st.session_state.last_result is not None:
+                if 'last_result' in st.session_state:
                     result = st.session_state.last_result
                     
-                    if result["prediction"] == "error":
-                        st.markdown(f"""
-                        <div class="prediction-box error">
-                            <h3 style="color: #F59E0B; text-align: center;">⚠️ PREDICTION ERROR</h3>
-                            <p><strong>Error:</strong> {result.get('error', 'Unknown error')}</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    elif result["prediction"] == "occupied":
+                    if result["prediction"] == "occupied":
                         st.markdown(f"""
                         <div class="prediction-box occupied">
                             <h3 style="color: #EF4444; text-align: center;">🚗 OCCUPIED</h3>
                             <p style="text-align: center; font-size: 24px; margin: 15px 0;">
                                 <strong>{result['confidence']:.1%}</strong> confidence
                             </p>
-                            <div class="info-box">
-                                <p><strong>Occupied Probability:</strong> {result['probability_occupied']:.1%}</p>
-                                <p><strong>Available Probability:</strong> {result['probability_available']:.1%}</p>
-                                <p><strong>Threshold Used:</strong> {st.session_state.predictor.current_threshold:.2f}</p>
-                            </div>
                         </div>
                         """, unsafe_allow_html=True)
                     else:
@@ -518,153 +687,204 @@ def main():
                             <p style="text-align: center; font-size: 24px; margin: 15px 0;">
                                 <strong>{result['confidence']:.1%}</strong> confidence
                             </p>
-                            <div class="info-box">
-                                <p><strong>Occupied Probability:</strong> {result['probability_occupied']:.1%}</p>
-                                <p><strong>Available Probability:</strong> {result['probability_available']:.1%}</p>
-                                <p><strong>Threshold Used:</strong> {st.session_state.predictor.current_threshold:.2f}</p>
-                            </div>
                         </div>
                         """, unsafe_allow_html=True)
-                    
-                    # Visualizations
-                    if result["prediction"] != "error":
-                        with st.expander("🔬 Feature Extraction", expanded=True):
-                            col_a, col_b, col_c = st.columns(3)
-                            with col_a:
-                                st.image(cv2.cvtColor(result["processed_image"], cv2.COLOR_BGR2RGB),
-                                        caption="Processed", use_container_width=True)
-                            with col_b:
-                                st.image(result["foreground_mask"], 
-                                        caption="Foreground Mask", use_container_width=True)
-                            with col_c:
-                                st.image(cv2.cvtColor(result["foreground_image"], cv2.COLOR_BGR2RGB),
-                                        caption="Foreground", use_container_width=True)
-                
-                else:
-                    if st.session_state.current_image is not None:
-                        st.info("Click 'Analyze This Spot' to see predictions")
-                    else:
-                        st.info("Upload an image to get started")
     
-    # Tab 2: Parking Lot
+    # Tab 2: Parking Lot (simplified)
     with tab2:
         st.markdown('<h2 class="sub-header">Parking Lot Analysis</h2>', unsafe_allow_html=True)
         
         if not st.session_state.model_loaded:
             st.warning("Please upload a model first")
         else:
-            # Use unique key for file uploader
             uploaded_lot = st.file_uploader("Upload parking lot image...", 
                                            type=['jpg', 'jpeg', 'png'],
-                                           key="parking_lot_uploader")
+                                           key="parking_lot")
             
-            if uploaded_lot is not None:
-                # Load image and store in session state
-                st.session_state.current_lot_image = load_image_from_upload(uploaded_lot)
+            if uploaded_lot:
+                file_bytes = np.asarray(bytearray(uploaded_lot.read()), dtype=np.uint8)
+                lot_image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
                 
-                if st.session_state.current_lot_image is not None:
-                    st.image(cv2.cvtColor(st.session_state.current_lot_image, cv2.COLOR_BGR2RGB),
-                            caption="Parking Lot Image", use_container_width=True)
-                    
-                    # Grid configuration
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        rows = st.number_input("Number of Rows", 1, 10, 3, key="lot_rows")
-                    with col2:
-                        cols = st.number_input("Spots per Row", 1, 20, 5, key="lot_cols")
-                    
-                    if st.button("🔍 Analyze Entire Parking Lot", type="primary", use_container_width=True):
-                        with st.spinner(f"Analyzing {rows}x{cols} spots..."):
-                            lot_image = st.session_state.current_lot_image
-                            spot_width = lot_image.shape[1] // cols
-                            spot_height = lot_image.shape[0] // rows
-                            
-                            results = []
-                            progress_bar = st.progress(0)
-                            
-                            for r in range(rows):
-                                for c in range(cols):
-                                    x, y = c * spot_width, r * spot_height
-                                    spot_img = lot_image[y:y+spot_height, x:x+spot_width]
-                                    
-                                    if spot_img.size > 0:
-                                        pred = st.session_state.predictor.predict_single_spot(spot_img)
-                                        results.append({
-                                            "id": f"R{r+1}C{c+1}",
-                                            "row": r+1,
-                                            "col": c+1,
-                                            "prediction": pred["prediction"],
-                                            "confidence": pred["confidence"],
-                                            "x": x,
-                                            "y": y
-                                        })
-                                    
-                                    # Update progress
-                                    progress = ((r * cols) + c + 1) / (rows * cols)
-                                    progress_bar.progress(progress)
-                            
-                            # Store results in session state
-                            st.session_state.lot_results = results
-                            st.session_state.lot_config = {"rows": rows, "cols": cols, "spot_width": spot_width, "spot_height": spot_height}
-                            
-                            st.success(f"✅ Analyzed {len(results)} spots!")
+                if lot_image is not None:
+                    st.image(cv2.cvtColor(lot_image, cv2.COLOR_BGR2RGB),
+                            caption="Parking Lot", use_container_width=True)
+    
+    # Tab 3: NEW VIDEO ANALYSIS TAB
+    with tab3:
+        st.markdown('<h2 class="sub-header">🎥 Video Parking Analysis</h2>', unsafe_allow_html=True)
+        
+        if not st.session_state.model_loaded:
+            st.warning("👈 Please upload a model first to analyze videos")
+        else:
+            # Video upload section
+            st.markdown("### Upload Parking Video")
+            uploaded_video = st.file_uploader("Choose a video file...", 
+                                            type=['mp4', 'avi', 'mov', 'mkv'],
+                                            key="video_uploader")
             
-            # Display stored results if available
-            if 'lot_results' in st.session_state and st.session_state.lot_results:
-                results = st.session_state.lot_results
-                config = st.session_state.lot_config
+            if uploaded_video:
+                # Save video to temp file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_video:
+                    tmp_video.write(uploaded_video.read())
+                    video_path = tmp_video.name
                 
-                # Summary metrics
-                occupied = sum(1 for r in results if r["prediction"] == "occupied")
-                available = sum(1 for r in results if r["prediction"] == "available")
-                total = len(results)
+                # Display video
+                st.video(uploaded_video)
                 
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Total Spots", total)
-                col2.metric("Occupied", occupied)
-                col3.metric("Available", available)
+                # Initialize video analyzer
+                if st.session_state.video_analyzer is None:
+                    st.session_state.video_analyzer = VideoParkingAnalyzer(st.session_state.predictor)
                 
-                # Create overlay visualization
-                if st.session_state.current_lot_image is not None:
-                    overlay = st.session_state.current_lot_image.copy()
-                    spot_width = config["spot_width"]
-                    spot_height = config["spot_height"]
+                # Process video button
+                if st.button("🎬 Process Video", type="primary", use_container_width=True):
+                    with st.spinner("Processing video frames..."):
+                        try:
+                            # Process video
+                            video_results = st.session_state.video_analyzer.process_video(
+                                video_path, 
+                                frame_interval=frame_interval,
+                                max_frames=max_frames
+                            )
+                            
+                            st.session_state.video_results = video_results
+                            st.success(f"✅ Video processed successfully!")
+                            
+                        except Exception as e:
+                            st.error(f"Error processing video: {e}")
+                
+                # Display results if available
+                if st.session_state.video_results:
+                    results = st.session_state.video_results
+                    video_info = results['video_info']
                     
-                    for result in results:
-                        x, y = result["x"], result["y"]
-                        
-                        # Set color based on prediction
-                        if result["prediction"] == "occupied":
-                            color = (0, 0, 255)  # Red
-                        elif result["prediction"] == "available":
-                            color = (0, 255, 0)  # Green
-                        else:
-                            color = (128, 128, 128)  # Gray
-                        
-                        # Draw rectangle
-                        cv2.rectangle(overlay, (x, y), (x + spot_width, y + spot_height), color, 2)
-                        cv2.putText(overlay, result["id"], (x + 5, y + 20),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    st.divider()
+                    st.markdown("### 📊 Video Analysis Results")
                     
-                    st.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB),
-                            caption="Parking Lot Analysis (Red=Occupied, Green=Available)",
-                            use_container_width=True)
+                    # Video info
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Total Frames", video_info['total_frames'])
+                    col2.metric("Processed Frames", video_info['processed_frames'])
+                    col3.metric("FPS", video_info['fps'])
+                    col4.metric("Duration", f"{video_info['duration']:.1f}s")
                     
-                    # Results table
-                    with st.expander("📋 Detailed Results", expanded=False):
-                        results_df = pd.DataFrame(results)
-                        st.dataframe(results_df[['id', 'prediction', 'confidence']], 
-                                   use_container_width=True)
+                    # Generate statistics
+                    stats = st.session_state.video_analyzer.generate_summary_stats(results['all_results'])
+                    
+                    if stats:
+                        # Overall statistics
+                        st.markdown("#### Overall Parking Statistics")
+                        overall = stats['overall']
                         
-                        # Download button
-                        csv = results_df.to_csv(index=False)
+                        col1, col2, col3, col4 = st.columns(4)
+                        col1.metric("Total Spots", overall['total_spots'])
+                        col2.metric("Avg Occupancy", f"{overall['avg_occupancy']:.1%}")
+                        col3.metric("Max Occupancy", f"{overall['max_occupancy']:.1%}")
+                        col4.metric("Min Occupancy", f"{overall['min_occupancy']:.1%}")
+                        
+                        # Occupancy over time chart
+                        st.markdown("#### Occupancy Over Time")
+                        time_series = stats['time_series']
+                        
+                        fig = px.line(time_series, x='frame', y='occupancy_rate',
+                                     title='Parking Occupancy Over Time',
+                                     labels={'frame': 'Frame Number', 'occupancy_rate': 'Occupancy Rate'})
+                        fig.update_layout(yaxis_tickformat='.0%')
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Spot-wise occupancy
+                        st.markdown("#### Spot-wise Occupancy Rates")
+                        spot_stats = stats['spot_stats'].sort_values('occupancy_rate', ascending=False)
+                        
+                        fig2 = px.bar(spot_stats.head(20), x='spot_id', y='occupancy_rate',
+                                     title='Top 20 Most Occupied Spots',
+                                     color='occupancy_rate',
+                                     color_continuous_scale='Reds')
+                        fig2.update_layout(yaxis_tickformat='.0%')
+                        st.plotly_chart(fig2, use_container_width=True)
+                        
+                        # Sample processed frames
+                        st.markdown("#### Sample Processed Frames")
+                        sample_frames = results['processed_frames'][::len(results['processed_frames'])//4]
+                        
+                        cols = st.columns(min(4, len(sample_frames)))
+                        for idx, frame_data in enumerate(sample_frames[:4]):
+                            with cols[idx]:
+                                frame = frame_data['frame']
+                                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                
+                                # Count occupied spots in this frame
+                                occupied = sum(1 for r in frame_data['results'] if r['prediction'] == 'occupied')
+                                total = len(frame_data['results'])
+                                
+                                st.image(frame_rgb, caption=f"Frame {frame_data['frame_number']}: {occupied}/{total} occupied", 
+                                        use_container_width=True)
+                        
+                        # Download results
+                        st.markdown("#### 📥 Download Results")
+                        
+                        # Download CSV
+                        csv_data = stats['raw_data'].to_csv(index=False)
                         st.download_button(
-                            label="📥 Download Results as CSV",
-                            data=csv,
-                            file_name=f"parking_lot_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv",
-                            use_container_width=True
+                            label="Download Raw Data (CSV)",
+                            data=csv_data,
+                            file_name=f"video_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv"
                         )
+                        
+                        # Download summary
+                        summary_text = f"""
+                        Video Parking Analysis Summary
+                        ============================
+                        
+                        Video Information:
+                        - Total Frames: {video_info['total_frames']}
+                        - Processed Frames: {video_info['processed_frames']}
+                        - FPS: {video_info['fps']}
+                        - Duration: {video_info['duration']:.1f} seconds
+                        
+                        Parking Statistics:
+                        - Total Spots: {overall['total_spots']}
+                        - Average Occupancy: {overall['avg_occupancy']:.1%}
+                        - Maximum Occupancy: {overall['max_occupancy']:.1%}
+                        - Minimum Occupancy: {overall['min_occupancy']:.1%}
+                        
+                        Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                        """
+                        
+                        st.download_button(
+                            label="Download Summary (TXT)",
+                            data=summary_text,
+                            file_name=f"video_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                            mime="text/plain"
+                        )
+                    
+                    # Cleanup temp file
+                    os.unlink(video_path)
+            
+            else:
+                # Show example/demo
+                st.info("""
+                ### How to use video analysis:
+                
+                1. **Upload a parking lot video** (MP4, AVI, MOV, MKV)
+                2. **Configure settings** in the sidebar:
+                   - Frame interval: Process every Nth frame
+                   - Max frames: Limit processing for long videos
+                3. **Click "Process Video"** to analyze
+                
+                ### What the analysis provides:
+                - ✅ Real-time spot detection and tracking
+                - 📊 Occupancy statistics over time
+                - 📈 Spot-wise occupancy rates
+                - 🎞️ Sample processed frames with visualizations
+                - 📥 Downloadable results (CSV, summary)
+                
+                ### Tips for best results:
+                - Use stable camera footage
+                - Ensure good lighting conditions
+                - Video should clearly show parking spots
+                - For long videos, increase frame interval
+                """)
 
 # Run the app
 if __name__ == "__main__":
