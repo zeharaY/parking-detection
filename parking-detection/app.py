@@ -26,70 +26,37 @@ from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
+# ============================
+# DUMMY IMBLEARN MODULE TO AVOID IMPORT ERRORS
+# ============================
+# Create dummy classes to prevent import errors when loading the pickled model
+class DummySMOTE:
+    def __init__(self, **kwargs):
+        pass
+
+class DummyImbPipeline:
+    def __init__(self, steps):
+        self.steps = steps
+    def fit(self, X, y):
+        return self
+    def predict(self, X):
+        pass
+    def predict_proba(self, X):
+        pass
 
 # ============================
-# SVM CLASSIFIER CLASS (ADD TO APP)
+# SIMPLIFIED SVM CLASSIFIER CLASS (FOR INFERENCE ONLY)
 # ============================
 class BackgroundSubtractionSVM:
     """
-    SVM classifier with background subtraction features
-    (Must match the training code)
+    Simplified SVM classifier for inference only
+    (No imblearn dependency needed)
     """
     
     def __init__(self, use_smote=True):
         self.use_smote = use_smote
         self.scaler = StandardScaler()
         self.svm = None
-        self.bg_subtractor = BackgroundSubtractor(method='mog2')
-    
-    def create_pipeline(self):
-        """Create ML pipeline with optional SMOTE"""
-        from sklearn.pipeline import Pipeline
-        
-        steps = [
-            ('scaler', self.scaler),
-        ]
-        
-        if self.use_smote:
-            from imblearn.over_sampling import SMOTE
-            steps.append(('smote', SMOTE(random_state=42)))
-        
-        steps.append(('svm', SVC(
-            kernel='rbf',
-            class_weight='balanced',
-            probability=True,
-            random_state=42
-        )))
-        
-        from imblearn.pipeline import Pipeline as ImbPipeline
-        return ImbPipeline(steps) if self.use_smote else Pipeline(steps)
-    
-    def fit(self, X_features, y, param_grid=None):
-        """Train SVM with grid search"""
-        # Create pipeline
-        pipeline = self.create_pipeline()
-        
-        # Use default param_grid if none provided
-        if param_grid is None:
-            param_grid = {
-                'svm__C': [0.1, 1, 10, 100],
-                'svm__gamma': ['scale', 'auto', 0.001, 0.01, 0.1],
-            }
-        
-        from sklearn.model_selection import GridSearchCV
-        grid_search = GridSearchCV(
-            pipeline,
-            param_grid,
-            cv=5,
-            scoring='f1_weighted',
-            n_jobs=-1,
-            verbose=1
-        )
-        
-        grid_search.fit(X_features, y)
-        self.svm = grid_search.best_estimator_
-        
-        return self
     
     def predict(self, X_features):
         """Make predictions"""
@@ -102,6 +69,7 @@ class BackgroundSubtractionSVM:
         if self.svm is None:
             raise ValueError("Model not trained yet")
         return self.svm.predict_proba(X_features)
+
 # ============================
 # CUSTOM BACKGROUND SUBTRACTOR CLASS
 # (Must match the training code)
@@ -228,7 +196,14 @@ class ParkingSpotPredictor:
     
     def __init__(self, model_data):
         """Initialize predictor with trained model"""
-        self.model = model_data['svm_model']
+        # Extract the actual SVM model from the custom class if needed
+        if hasattr(model_data['svm_model'], 'svm'):
+            # If it's our custom BackgroundSubtractionSVM class
+            self.model = model_data['svm_model'].svm
+        else:
+            # If it's already a trained sklearn model
+            self.model = model_data['svm_model']
+            
         self.bg_subtractor = model_data['bg_subtractor']
         self.feature_names = model_data.get('feature_names', [])
         self.model_accuracy = model_data.get('accuracy', 0.0)
@@ -292,6 +267,11 @@ class ParkingSpotPredictor:
         processed_image = self.preprocess_image(image)
         features, mask, foreground = self.extract_features(processed_image)
         features_reshaped = features.reshape(1, -1)
+        
+        # Scale features if needed
+        if hasattr(self.model, 'named_steps') and 'scaler' in self.model.named_steps:
+            # If model is a pipeline with scaler
+            features_reshaped = self.model.named_steps['scaler'].transform(features_reshaped)
         
         if hasattr(self.model, 'predict_proba'):
             proba = self.model.predict_proba(features_reshaped)[0]
@@ -413,8 +393,30 @@ def main():
                         tmp.write(uploaded_model.getvalue())
                         tmp_path = tmp.name
                     
-                    # Load model
+                    # Add dummy imblearn module to sys.modules before loading
+                    import types
+                    dummy_imblearn = types.ModuleType('imblearn')
+                    dummy_imblearn.over_sampling = types.ModuleType('imblearn.over_sampling')
+                    dummy_imblearn.over_sampling.SMOTE = DummySMOTE
+                    dummy_imblearn.pipeline = types.ModuleType('imblearn.pipeline')
+                    dummy_imblearn.pipeline.Pipeline = DummyImbPipeline
+                    
+                    sys.modules['imblearn'] = dummy_imblearn
+                    sys.modules['imblearn.over_sampling'] = dummy_imblearn.over_sampling
+                    sys.modules['imblearn.pipeline'] = dummy_imblearn.pipeline
+                    
+                    # Now load the model
                     model_data = joblib.load(tmp_path)
+                    
+                    # Check and fix the model structure if needed
+                    if isinstance(model_data.get('svm_model'), BackgroundSubtractionSVM):
+                        # If it's our custom class, extract the actual model
+                        if hasattr(model_data['svm_model'], 'svm'):
+                            # The actual sklearn model is stored in .svm attribute
+                            svm_model = model_data['svm_model'].svm
+                            if svm_model is None:
+                                raise ValueError("Model not properly trained")
+                            model_data['svm_model'] = svm_model
                     
                     # Initialize predictor
                     st.session_state.predictor = ParkingSpotPredictor(model_data)
@@ -436,6 +438,12 @@ def main():
                 
                 except Exception as e:
                     st.error(f"❌ Error loading model: {str(e)}")
+                    st.info("""
+                    **Troubleshooting tips:**
+                    1. Make sure you're using the correct model file
+                    2. Train a new model using the updated training code
+                    3. Check if all dependencies are installed
+                    """)
                     st.session_state.model_loaded = False
         
         st.divider()
@@ -538,8 +546,8 @@ def main():
             with col_info2:
                 st.info("""
                 **Need a model file?**
-                Download sample model:
-                [parking_detection_model.pkl](https://drive.google.com/uc?export=download&id=YOUR_MODEL_ID)
+                - Make sure to use the updated training code
+                - The model should save only sklearn components
                 """)
         else:
             col_left, col_right = st.columns([1, 1])
