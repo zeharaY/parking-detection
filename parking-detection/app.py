@@ -1,6 +1,6 @@
 """
 🚗 Parking Spot Detection App
-Deployed on Streamlit Cloud
+Clean version for Streamlit Cloud
 """
 
 import streamlit as st
@@ -13,24 +13,19 @@ import joblib
 import json
 import time
 from datetime import datetime, timedelta
-import requests
 from PIL import Image
-import io
-import base64
-from collections import defaultdict
 import tempfile
 import os
-import sys
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
 
 # ============================
-# CUSTOM BACKGROUND SUBTRACTOR CLASS
-# (Must match the training code)
+# BACKGROUND SUBTRACTOR CLASS
 # ============================
 class BackgroundSubtractor:
-    """
-    Custom background subtraction for parking spot analysis
-    Identical to the one used in training
-    """
+    """Background subtraction for parking spot analysis"""
+    
     def __init__(self, method='mog2', learning_rate=0.001,
                  history=500, varThreshold=16, detectShadows=False, dist2Threshold=400):
         self.method = method
@@ -40,56 +35,60 @@ class BackgroundSubtractor:
         self.detectShadows = detectShadows
         self.dist2Threshold = dist2Threshold
         self._init_cv2_subtractor()
-
+    
     def _init_cv2_subtractor(self):
-        """Initializes the cv2 background subtractor object"""
+        """Initialize OpenCV background subtractor"""
         if self.method == 'mog2':
             self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-                history=self.history, 
-                varThreshold=self.varThreshold, 
+                history=self.history,
+                varThreshold=self.varThreshold,
                 detectShadows=self.detectShadows
             )
-        elif self.method == 'knn':
+        else:  # 'knn'
             self.bg_subtractor = cv2.createBackgroundSubtractorKNN(
-                history=self.history, 
-                dist2Threshold=self.dist2Threshold, 
+                history=self.history,
+                dist2Threshold=self.dist2Threshold,
                 detectShadows=self.detectShadows
             )
-        else:
-            raise ValueError("Method must be 'mog2' or 'knn'")
-
+    
     def __getstate__(self):
         """Prepare for pickling"""
         state = self.__dict__.copy()
-        del state['bg_subtractor']
+        if 'bg_subtractor' in state:
+            del state['bg_subtractor']
         return state
-
+    
     def __setstate__(self, state):
         """Restore from pickling"""
         self.__dict__.update(state)
         self._init_cv2_subtractor()
-
+    
     def apply(self, image):
-        """Apply background subtraction to image"""
+        """Apply background subtraction"""
         fg_mask = self.bg_subtractor.apply(image, learningRate=self.learning_rate)
         
+        # Clean up mask
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
         
         foreground = cv2.bitwise_and(image, image, mask=fg_mask)
         return foreground, fg_mask
-
+    
     def extract_features(self, image, mask):
         """Extract features from foreground"""
         features = []
         
+        # Convert to grayscale
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # 1. Foreground percentage
         total_pixels = mask.size
         foreground_pixels = np.sum(mask > 0)
         foreground_percentage = foreground_pixels / total_pixels
         features.append(foreground_percentage)
-
+        
+        # 2. Foreground statistics
         if foreground_pixels > 0:
             mean_intensity = np.mean(gray[mask > 0])
             features.append(mean_intensity)
@@ -97,6 +96,7 @@ class BackgroundSubtractor:
             std_intensity = np.std(gray[mask > 0])
             features.append(std_intensity)
             
+            # Compactness
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
                 largest_contour = max(contours, key=cv2.contourArea)
@@ -108,10 +108,11 @@ class BackgroundSubtractor:
                 features.extend([0, 0])
         else:
             features.extend([0, 0, 0])
-
+        
+        # 3. Color features (HSV)
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         if foreground_pixels > 0:
-            for i in range(3):
+            for i in range(3):  # H, S, V channels
                 channel_values = hsv[:,:,i][mask > 0]
                 if len(channel_values) > 0:
                     features.append(np.mean(channel_values))
@@ -120,24 +121,26 @@ class BackgroundSubtractor:
                     features.extend([0, 0])
         else:
             features.extend([0, 0, 0, 0, 0, 0])
-
+        
+        # 4. Edge density
         edges = cv2.Canny(gray, 50, 150)
         if foreground_pixels > 0:
             edge_density = np.sum(edges[mask > 0]) / (foreground_pixels * 255)
             features.append(edge_density)
         else:
             features.append(0)
-
+        
+        # 5. Texture features
         sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
         sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
         gradient_magnitude = np.sqrt(sobelx**2 + sobely**2)
-
+        
         if foreground_pixels > 0:
             features.append(np.mean(gradient_magnitude[mask > 0]))
             features.append(np.std(gradient_magnitude[mask > 0]))
         else:
             features.extend([0, 0])
-
+        
         return np.array(features)
 
 # ============================
@@ -148,11 +151,13 @@ class ParkingSpotPredictor:
     
     def __init__(self, model_data):
         """Initialize predictor with trained model"""
+        # Extract model components
         self.model = model_data['svm_model']
         self.bg_subtractor = model_data['bg_subtractor']
         self.feature_names = model_data.get('feature_names', [])
         self.model_accuracy = model_data.get('accuracy', 0.0)
         
+        # Lighting adjustment profiles
         self.lighting_profiles = {
             "daylight": {"threshold": 0.5, "brightness": 0, "contrast": 0},
             "dusk": {"threshold": 0.45, "brightness": -20, "contrast": 10},
@@ -163,6 +168,12 @@ class ParkingSpotPredictor:
         
         self.current_threshold = 0.5
         self.current_lighting_mode = "daylight"
+        
+        # Get the actual sklearn model
+        if hasattr(self.model, 'svm'):
+            self.sklearn_model = self.model.svm
+        else:
+            self.sklearn_model = self.model
         
         st.success(f"✅ Model loaded successfully (Accuracy: {self.model_accuracy:.2%})")
     
@@ -183,21 +194,26 @@ class ParkingSpotPredictor:
     
     def preprocess_image(self, image):
         """Preprocess parking spot image"""
+        # Resize to 64x64 (same as training)
         target_size = (64, 64)
         resized = cv2.resize(image, target_size)
         
+        # Apply lighting adjustment
         profile = self.lighting_profiles[self.current_lighting_mode]
         hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
         h, s, v = cv2.split(hsv)
         
+        # Adjust brightness
         v = cv2.add(v, profile["brightness"])
         v = np.clip(v, 0, 255)
         
+        # Adjust contrast
         if profile["contrast"] != 0:
             alpha = 1 + profile["contrast"] / 100
             v = cv2.multiply(v, alpha)
             v = np.clip(v, 0, 255)
         
+        # Merge back
         hsv_adjusted = cv2.merge([h, s, v])
         return cv2.cvtColor(hsv_adjusted, cv2.COLOR_HSV2BGR)
     
@@ -209,19 +225,25 @@ class ParkingSpotPredictor:
     
     def predict_single_spot(self, image):
         """Predict occupancy for a single parking spot"""
+        # Preprocess
         processed_image = self.preprocess_image(image)
+        
+        # Extract features
         features, mask, foreground = self.extract_features(processed_image)
         features_reshaped = features.reshape(1, -1)
         
-        if hasattr(self.model, 'predict_proba'):
-            proba = self.model.predict_proba(features_reshaped)[0]
+        # Get prediction probabilities
+        if hasattr(self.sklearn_model, 'predict_proba'):
+            proba = self.sklearn_model.predict_proba(features_reshaped)[0]
             confidence = max(proba)
             prediction = 1 if proba[1] >= self.current_threshold else 0
         else:
-            prediction = self.model.predict(features_reshaped)[0]
+            # Fallback
+            prediction = self.sklearn_model.predict(features_reshaped)[0]
             proba = [1 - prediction, prediction]
             confidence = 0.8
         
+        # Get feature values for explanation
         feature_values = {}
         if self.feature_names and len(self.feature_names) == len(features):
             for i, (name, value) in enumerate(zip(self.feature_names, features)):
@@ -240,6 +262,62 @@ class ParkingSpotPredictor:
             "foreground_image": foreground,
             "feature_vector": features.tolist()
         }
+    
+    def predict_batch(self, images_list):
+        """Predict occupancy for multiple parking spots"""
+        results = []
+        for i, image in enumerate(images_list):
+            result = self.predict_single_spot(image)
+            result["spot_id"] = f"spot_{i+1}"
+            results.append(result)
+        return results
+    
+    def predict_parking_lot(self, lot_image, spots_config):
+        """Predict occupancy for entire parking lot"""
+        results = {
+            "timestamp": datetime.now().isoformat(),
+            "total_spots": len(spots_config),
+            "occupied_spots": 0,
+            "available_spots": 0,
+            "spot_details": [],
+            "utilization_rate": 0,
+            "lighting_mode": self.current_lighting_mode,
+            "threshold": self.current_threshold
+        }
+        
+        for spot_config in spots_config:
+            spot_id = spot_config.get("id", f"spot_{len(results['spot_details'])+1}")
+            x, y, w, h = spot_config["bbox"]
+            
+            # Extract spot from lot image
+            spot_img = lot_image[y:y+h, x:x+w]
+            if spot_img.size == 0:
+                continue
+            
+            # Predict
+            prediction_result = self.predict_single_spot(spot_img)
+            
+            # Update counts
+            if prediction_result["prediction"] == "occupied":
+                results["occupied_spots"] += 1
+            else:
+                results["available_spots"] += 1
+            
+            # Add to details
+            results["spot_details"].append({
+                "id": spot_id,
+                "state": prediction_result["prediction"],
+                "confidence": prediction_result["confidence"],
+                "bbox": spot_config["bbox"],
+                "position": spot_config.get("position", "Unknown"),
+                "probability_occupied": prediction_result["probability_occupied"]
+            })
+        
+        # Calculate utilization
+        if results["total_spots"] > 0:
+            results["utilization_rate"] = results["occupied_spots"] / results["total_spots"]
+        
+        return results
 
 # ============================
 # STREAMLIT APP
@@ -321,7 +399,7 @@ def main():
         st.subheader("📁 Upload Trained Model")
         uploaded_model = st.file_uploader(
             "Choose your parking_detection_model.pkl",
-            type=['pkl'],
+            type=['pkl', 'joblib'],
             help="Upload the model file saved from your training"
         )
         
@@ -423,21 +501,20 @@ def main():
         
         st.divider()
         
-        # Deployment info
-        st.subheader("🌐 Deployment Info")
-        st.info("""
-        **Deployed on:** Streamlit Cloud
-        **Status:** Online
-        **Model:** Parking Detection SVM
-        **Last Updated:** {}
-        """.format(datetime.now().strftime("%Y-%m-%d")))
+        # App info
+        st.subheader("ℹ️ App Information")
+        st.info(f"""
+        **Status:** {'Model Loaded' if st.session_state.model_loaded else 'Ready for Model Upload'}
+        **Last Updated:** {datetime.now().strftime("%Y-%m-%d %H:%M")}
+        **Version:** 1.0
+        """)
     
     # Main content tabs
     tab1, tab2, tab3, tab4 = st.tabs([
         "🔍 Single Spot Prediction", 
         "📊 Parking Lot Analysis", 
         "📈 Model Insights",
-        "🚀 Deployment Guide"
+        "📁 Batch Processing"
     ])
     
     # Tab 1: Single Spot Prediction
@@ -458,9 +535,11 @@ def main():
             
             with col_info2:
                 st.info("""
-                **Need a model file?**
-                Download sample model:
-                [parking_detection_model.pkl](https://drive.google.com/uc?export=download&id=YOUR_MODEL_ID)
+                **Features:**
+                - Real-time prediction
+                - Lighting adjustment
+                - Feature visualization
+                - Confidence scores
                 """)
         else:
             col_left, col_right = st.columns([1, 1])
@@ -711,7 +790,6 @@ def main():
             
             with col_insight2:
                 st.subheader("Threshold Analysis")
-                st.info("Adjust the threshold in the sidebar to see how it affects predictions")
                 
                 # Show threshold impact
                 thresholds = np.linspace(0.1, 0.9, 9)
@@ -783,162 +861,141 @@ def main():
                 - **Night:** Use 'night' mode with lower threshold
                 - **Overcast:** Use 'overcast' mode
                 - **High Contrast:** Use 'bright_sun' mode
-                
-                **📊 Monitoring:**
-                - Monitor accuracy over time
-                - Adjust threshold based on results
-                - Retrain model with new data periodically
                 """)
     
-    # Tab 4: Deployment Guide
+    # Tab 4: Batch Processing
     with tab4:
-        st.header("🚀 Streamlit Cloud Deployment Guide")
+        st.header("Batch Processing of Parking Spots")
         
-        col_guide1, col_guide2 = st.columns(2)
-        
-        with col_guide1:
-            st.subheader("Step-by-Step Deployment")
+        if not st.session_state.model_loaded:
+            st.warning("Upload a model to enable batch processing")
+        else:
+            st.info("Upload multiple parking spot images for batch prediction")
             
-            st.markdown("""
-            ### **1. Prepare Your Files**
-            ```
-            your-repo/
-            ├── app.py              # This Streamlit app
-            ├── requirements.txt    # Dependencies
-            ├── parking_detection_model.pkl  # Your trained model
-            └── README.md          # Optional documentation
-            ```
-            
-            ### **2. Create requirements.txt**
-            ```txt
-            streamlit>=1.28.0
-            plotly>=5.17.0
-            pandas>=2.0.0
-            numpy>=1.24.0
-            opencv-python>=4.8.0
-            scikit-learn>=1.3.0
-            joblib>=1.3.0
-            Pillow>=10.0.0
-            ```
-            
-            ### **3. Push to GitHub**
-            ```bash
-            git init
-            git add .
-            git commit -m "Deploy parking detection app"
-            git branch -M main
-            git remote add origin https://github.com/yourusername/parking-detection.git
-            git push -u origin main
-            ```
-            """)
-        
-        with col_guide2:
-            st.subheader("Deploy on Streamlit Cloud")
-            
-            st.markdown("""
-            ### **4. Go to Streamlit Cloud**
-            Visit: [share.streamlit.io](https://share.streamlit.io)
-            
-            ### **5. Deploy Your App**
-            1. Click "New app"
-            2. Connect your GitHub account
-            3. Select your repository
-            4. Choose branch (main)
-            5. Set main file path to `app.py`
-            6. Click "Deploy!"
-            
-            ### **6. Your App is Live!**
-            Your app will be available at:
-            ```
-            https://yourusername-parking-detection.streamlit.app
-            ```
-            
-            ### **🎉 Congratulations!**
-            Your parking detection app is now:
-            - ☁️ Hosted in the cloud
-            - 🔄 Always available
-            - 📱 Mobile responsive
-            - 🔒 Secure HTTPS
-            """)
-        
-        st.divider()
-        
-        # Quick deployment buttons
-        st.subheader("Quick Start Templates")
-        
-        col_template1, col_template2, col_template3 = st.columns(3)
-        
-        with col_template1:
-            # Download app.py
-            app_code = '''
-import streamlit as st
-import pandas as pd
-import numpy as np
-import cv2
-import joblib
-from PIL import Image
-import tempfile
-import os
-
-st.title("🚗 Parking Spot Detection")
-st.write("Upload your trained model and spot images")
-
-# Add your model prediction code here
-'''
-            
-            st.download_button(
-                label="📥 Download Minimal App",
-                data=app_code,
-                file_name="app.py",
-                mime="text/x-python",
-                use_container_width=True
+            # Multiple file upload
+            uploaded_files = st.file_uploader(
+                "Choose multiple parking spot images",
+                type=['jpg', 'jpeg', 'png'],
+                accept_multiple_files=True,
+                key="batch_files"
             )
-        
-        with col_template2:
-            requirements = '''streamlit>=1.28.0
-pandas>=2.0.0
-numpy>=1.24.0
-opencv-python>=4.8.0
-scikit-learn>=1.3.0
-joblib>=1.3.0
-Pillow>=10.0.0
-'''
             
-            st.download_button(
-                label="📥 Download Requirements",
-                data=requirements,
-                file_name="requirements.txt",
-                mime="text/plain",
-                use_container_width=True
-            )
-        
-        with col_template3:
-            readme = '''# Parking Spot Detection App
-
-This app uses AI to detect parking spot occupancy.
-
-## Features
-- Single spot prediction
-- Parking lot analysis
-- Adjustable lighting modes
-- Real-time results
-
-## Deployment
-Deployed on Streamlit Cloud
-
-## Model
-Trained using background subtraction + SVM
-'''
+            if uploaded_files:
+                # Process files
+                if st.button("🚀 Process All Images", type="primary", use_container_width=True):
+                    with st.spinner(f"Processing {len(uploaded_files)} images..."):
+                        images = []
+                        file_names = []
+                        
+                        for uploaded_file in uploaded_files:
+                            # Convert to OpenCV format
+                            file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+                            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                            images.append(image)
+                            file_names.append(uploaded_file.name)
+                        
+                        # Make predictions
+                        results = st.session_state.predictor.predict_batch(images)
+                        
+                        # Add file names
+                        for i, result in enumerate(results):
+                            result["filename"] = file_names[i]
+                        
+                        # Store results
+                        st.session_state.batch_results = results
+                        
+                        st.success(f"✅ Processed {len(results)} images!")
             
-            st.download_button(
-                label="📥 Download README",
-                data=readme,
-                file_name="README.md",
-                mime="text/markdown",
-                use_container_width=True
-            )
-        
-        st.info("💡 **Pro Tip:** For best performance, keep your model file under 100MB and use image compression for faster uploads.")
+            # Display batch results
+            if 'batch_results' in st.session_state:
+                results = st.session_state.batch_results
+                
+                # Summary
+                occupied_count = sum(1 for r in results if r["prediction"] == "occupied")
+                available_count = len(results) - occupied_count
+                
+                col_sum1, col_sum2, col_sum3 = st.columns(3)
+                
+                with col_sum1:
+                    st.metric("Total Images", len(results))
+                
+                with col_sum2:
+                    st.metric("Occupied Spots", occupied_count)
+                
+                with col_sum3:
+                    st.metric("Available Spots", available_count)
+                
+                # Results table
+                st.subheader("Detailed Results")
+                
+                # Prepare data for display
+                display_data = []
+                for result in results:
+                    display_data.append({
+                        "Filename": result["filename"],
+                        "Prediction": result["prediction"].upper(),
+                        "Confidence": f"{result['confidence']:.1%}",
+                        "Prob. Occupied": f"{result['probability_occupied']:.1%}",
+                        "Prob. Available": f"{result['probability_available']:.1%}"
+                    })
+                
+                results_df = pd.DataFrame(display_data)
+                st.dataframe(results_df, use_container_width=True, hide_index=True)
+                
+                # Visualizations
+                st.subheader("Batch Analysis")
+                
+                col_viz1, col_viz2 = st.columns(2)
+                
+                with col_viz1:
+                    # Pie chart
+                    fig = px.pie(
+                        names=["Occupied", "Available"],
+                        values=[occupied_count, available_count],
+                        title="Occupancy Distribution",
+                        color=["Occupied", "Available"],
+                        color_discrete_map={"Occupied": "red", "Available": "green"}
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with col_viz2:
+                    # Confidence distribution
+                    confidences = [r["confidence"] for r in results]
+                    fig = px.histogram(
+                        x=confidences,
+                        nbins=10,
+                        title="Confidence Distribution",
+                        labels={"x": "Confidence", "y": "Count"}
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Download results
+                st.subheader("Export Results")
+                
+                # JSON export
+                json_data = json.dumps(results, indent=2, default=str)
+                
+                col_dl1, col_dl2 = st.columns(2)
+                
+                with col_dl1:
+                    st.download_button(
+                        label="📥 Download JSON",
+                        data=json_data,
+                        file_name=f"batch_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        mime="application/json",
+                        use_container_width=True
+                    )
+                
+                with col_dl2:
+                    # CSV export
+                    csv_data = results_df.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download CSV",
+                        data=csv_data,
+                        file_name=f"batch_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
 
 # ============================
 # RUN THE APP
