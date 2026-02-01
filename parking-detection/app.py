@@ -22,6 +22,86 @@ import tempfile
 import os
 import sys
 
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+
+# ============================
+# SVM CLASSIFIER CLASS (ADD TO APP)
+# ============================
+class BackgroundSubtractionSVM:
+    """
+    SVM classifier with background subtraction features
+    (Must match the training code)
+    """
+    
+    def __init__(self, use_smote=True):
+        self.use_smote = use_smote
+        self.scaler = StandardScaler()
+        self.svm = None
+        self.bg_subtractor = BackgroundSubtractor(method='mog2')
+    
+    def create_pipeline(self):
+        """Create ML pipeline with optional SMOTE"""
+        from sklearn.pipeline import Pipeline
+        
+        steps = [
+            ('scaler', self.scaler),
+        ]
+        
+        if self.use_smote:
+            from imblearn.over_sampling import SMOTE
+            steps.append(('smote', SMOTE(random_state=42)))
+        
+        steps.append(('svm', SVC(
+            kernel='rbf',
+            class_weight='balanced',
+            probability=True,
+            random_state=42
+        )))
+        
+        from imblearn.pipeline import Pipeline as ImbPipeline
+        return ImbPipeline(steps) if self.use_smote else Pipeline(steps)
+    
+    def fit(self, X_features, y, param_grid=None):
+        """Train SVM with grid search"""
+        # Create pipeline
+        pipeline = self.create_pipeline()
+        
+        # Use default param_grid if none provided
+        if param_grid is None:
+            param_grid = {
+                'svm__C': [0.1, 1, 10, 100],
+                'svm__gamma': ['scale', 'auto', 0.001, 0.01, 0.1],
+            }
+        
+        from sklearn.model_selection import GridSearchCV
+        grid_search = GridSearchCV(
+            pipeline,
+            param_grid,
+            cv=5,
+            scoring='f1_weighted',
+            n_jobs=-1,
+            verbose=1
+        )
+        
+        grid_search.fit(X_features, y)
+        self.svm = grid_search.best_estimator_
+        
+        return self
+    
+    def predict(self, X_features):
+        """Make predictions"""
+        if self.svm is None:
+            raise ValueError("Model not trained yet")
+        return self.svm.predict(X_features)
+    
+    def predict_proba(self, X_features):
+        """Get prediction probabilities"""
+        if self.svm is None:
+            raise ValueError("Model not trained yet")
+        return self.svm.predict_proba(X_features)
 # ============================
 # CUSTOM BACKGROUND SUBTRACTOR CLASS
 # (Must match the training code)
