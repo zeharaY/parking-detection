@@ -2,7 +2,16 @@
 🚗 Parking Spot Detection App
 Fixed for Streamlit Cloud
 """
+import subprocess
+import sys
 
+# Try to import imblearn, if it fails, install it
+try:
+    from imblearn.over_sampling import SMOTE
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "imbalanced-learn"])
+    from imblearn.over_sampling import SMOTE
+    
 import streamlit as st
 import pandas as pd
 import numpy as np
